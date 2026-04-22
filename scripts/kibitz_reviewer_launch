@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# kibitz_reviewer_launch — thin exec wrapper invoked by `tmux split-window`.
+# Reads the reviewer role file at exec time and launches the agent with it,
+# keeping all multi-line / quoted content local to this script (never crossing
+# the tmux command-string boundary).
+set -euo pipefail
+
+agent="${1:?usage: kibitz_reviewer_launch [codex|claude]}"
+
+case "$agent" in
+  codex)
+    role_file="$HOME/.codex/systemprompts/kibitz-reviewer.md"
+    if [[ -f "$role_file" ]]; then
+      exec codex --config developer_instructions="$(<"$role_file")"
+    fi
+    exec codex
+    ;;
+  claude)
+    if [[ -f "$HOME/.claude/agents/kibitz-reviewer.md" ]]; then
+      exec claude --agent kibitz-reviewer
+    fi
+    exec claude
+    ;;
+  *)
+    echo "kibitz_reviewer_launch: unknown agent '$agent'" >&2
+    exit 2
+    ;;
+esac

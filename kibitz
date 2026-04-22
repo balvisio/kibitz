@@ -1,0 +1,563 @@
+#!/usr/bin/env bash
+# kibitz — run a sidecar reviewer agent (codex or claude) in a tmux split pane.
+# Usage: kibitz {install|start [agent]|stop|status|restart [agent]}
+set -euo pipefail
+
+KNOWN_LABELS=("codex" "claude-reviewer")
+INSTALL_DIR="$HOME/.local/bin"
+HOOK_SCRIPT_NAME="kibitz_hook_stop.py"
+HOOK_JSON_NAME="kibitz_hook.json"
+SETTINGS_FILE="$HOME/.claude/settings.json"
+HOOK_LOG_PATH="$HOME/.claude/kibitz-hook.log"
+
+# Reviewer role artifacts. The launcher wraps the agent binary so we can feed
+# the role prompt in at exec time without quoting issues crossing tmux split-window.
+LAUNCHER_NAME="kibitz_reviewer_launch"
+CLAUDE_AGENTS_DIR="$HOME/.claude/agents"
+CLAUDE_AGENT_FILE="kibitz-reviewer.md"
+CODEX_ROLE_DIR="$HOME/.codex/systemprompts"
+CODEX_ROLE_FILE="kibitz-reviewer.md"
+
+# Remote bootstrap target — used only when `install` is invoked via `curl | bash`
+# (no local file to resolve sibling files from).
+KIBITZ_REPO="${KIBITZ_REPO:-balvisio/kibitz}"
+KIBITZ_BRANCH="${KIBITZ_BRANCH:-main}"
+
+# Colors: only emit ANSI if stdout is a TTY and NO_COLOR isn't set.
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  RED=$'\033[1;31m'
+  GREEN=$'\033[1;32m'
+  YELLOW=$'\033[1;33m'
+  RESET=$'\033[0m'
+else
+  RED=""
+  GREEN=""
+  YELLOW=""
+  RESET=""
+fi
+
+info() { printf '%s[kibitz]%s %s\n' "$GREEN" "$RESET" "$*"; }
+warn() { printf '%s[kibitz] %s%s\n' "$YELLOW" "$*" "$RESET"; }
+die()  { printf '%s[kibitz] error: %s%s\n' "$RED" "$*" "$RESET" >&2; exit 1; }
+
+in_tmux() { [[ -n "${TMUX:-}" ]]; }
+
+# ---------- Agent registry ----------
+agent_binary() {
+  case "$1" in
+    codex)  echo codex ;;
+    claude) echo claude ;;
+    *) return 1 ;;
+  esac
+}
+agent_label() {
+  case "$1" in
+    codex)  echo codex ;;
+    claude) echo claude-reviewer ;;
+    *) return 1 ;;
+  esac
+}
+
+# ---------- Host detection ----------
+walk_ppid_for_agent() {
+  local pid=$PPID count=0
+  while [[ -n "$pid" && "$pid" != "0" && "$pid" != "1" && $count -lt 32 ]]; do
+    local exe comm
+    exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+    comm=$(tr -d '\n' < "/proc/$pid/comm" 2>/dev/null || true)
+    case "$exe" in
+      */codex)  echo codex;  return 0 ;;
+      */claude) echo claude; return 0 ;;
+    esac
+    case "$comm" in
+      codex)  echo codex;  return 0 ;;
+      claude) echo claude; return 0 ;;
+    esac
+    local stat
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null || true)
+    [[ -z "$stat" ]] && break
+    # /proc/X/stat: pid (comm) state ppid ...  — comm may contain spaces/parens,
+    # so find the LAST ')' and take field +2 (skipping state).
+    pid=$(echo "$stat" | awk '{ for (i=NF; i>=1; i--) if ($i ~ /\)$/) { print $(i+2); exit } }')
+    count=$((count+1))
+  done
+  return 1
+}
+
+# CLAUDECODE=1 is set per-tool-call by Claude Code; codex sets no env marker.
+detect_host_agent() {
+  [[ "${CLAUDECODE:-}" == "1" ]] && { echo claude; return 0; }
+  walk_ppid_for_agent
+}
+
+# Resolution order: explicit arg > host=claude→codex > host=codex→claude > error.
+pick_reviewer_agent() {
+  if [[ -n "${1:-}" ]]; then
+    agent_binary "$1" >/dev/null 2>&1 \
+      || die "unknown agent: $1 (valid: codex, claude)"
+    echo "$1"
+    return
+  fi
+  local host
+  if host=$(detect_host_agent); then
+    case "$host" in
+      claude) echo codex ;;
+      codex)  echo claude ;;
+    esac
+    return
+  fi
+  die "couldn't detect host agent — pass one explicitly: $(basename "$0") start {codex|claude}"
+}
+
+# ---------- Pane lookup ----------
+# Scoped to the *current tmux window*: kibitz is a per-window sidecar (it splits
+# this window), so another window's reviewer must not block `start` here or be
+# killed by `stop` here. Outside tmux the list-panes call errors; we swallow it
+# so status/stop degrade to "not running" rather than blowing up.
+find_reviewer_pane() {
+  local panes
+  panes=$(tmux list-panes -F '#{pane_id} #{@name}' 2>/dev/null || true)
+  [[ -z "$panes" ]] && return 0
+  local labels_joined=" ${KNOWN_LABELS[*]} "
+  echo "$panes" | awk -v labels="$labels_joined" '
+    $2 != "" && index(labels, " " $2 " ") > 0 { print $0; exit }
+  '
+}
+
+# ---------- smux guard ----------
+has_bridge() { command -v tmux-bridge >/dev/null 2>&1; }
+
+warn_if_no_bridge() {
+  has_bridge && return 0
+  cat <<WARN
+
+${RED}========================================================================
+!!!            WARNING: tmux-bridge NOT FOUND on PATH                !!!
+========================================================================${RESET}
+${RED}The reviewer can still run, but the smux communication layer is
+missing. Without it:
+  - Reviewer messages to the host won't carry the '[tmux-bridge from:... ]'
+    header, so the host agent can't distinguish them from real user input.
+  - The Stop hook that forwards each exchange has no reliable
+    cross-pane transport.
+
+Install via:
+  $(basename "$0") install
+========================================================================${RESET}
+
+WARN
+}
+
+# ---------- install ----------
+ensure_path() {
+  local bin_dir="$1"
+  local rc_file=""
+  case "${SHELL:-/bin/bash}" in
+    */zsh)  rc_file="$HOME/.zshrc" ;;
+    */bash) rc_file="$HOME/.bashrc" ;;
+    *)      rc_file="$HOME/.profile" ;;
+  esac
+
+  if [[ -f "$rc_file" ]] && grep -qF "$bin_dir" "$rc_file"; then
+    return 0
+  fi
+
+  info "Adding $bin_dir to PATH in $rc_file"
+  {
+    echo ""
+    echo "# kibitz / smux"
+    echo "export PATH=\"$bin_dir:\$PATH\""
+  } >> "$rc_file"
+}
+
+copy_script() {
+  local src="$1" dst="$2"
+  local src_real dst_real
+  src_real=$(readlink -f "$src" 2>/dev/null || echo "$src")
+  dst_real=$(readlink -f "$dst" 2>/dev/null || echo "$dst")
+  if [[ "$src_real" != "$dst_real" ]]; then
+    cp "$src" "$dst"
+  fi
+  chmod +x "$dst"
+}
+
+# Fetch the kibitz repo tarball into $1, stripped of its top-level directory.
+bootstrap_into() {
+  local dest="$1"
+  local url="https://codeload.github.com/${KIBITZ_REPO}/tar.gz/refs/heads/${KIBITZ_BRANCH}"
+
+  command -v tar >/dev/null 2>&1 || die "tar is required for remote install"
+
+  info "Fetching $KIBITZ_REPO@$KIBITZ_BRANCH"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" | tar xz -C "$dest" --strip-components=1
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- "$url" | tar xz -C "$dest" --strip-components=1
+  else
+    die "need curl or wget for remote install"
+  fi
+}
+
+# Merge a Stop-hook fragment into ~/.claude/settings.json without clobbering
+# other hooks. Idempotent: skips the append if our command is already present.
+merge_settings() {
+  local fragment="$1"
+  python3 - "$fragment" "$SETTINGS_FILE" "$HOOK_SCRIPT_NAME" <<'PY'
+import json, sys
+from pathlib import Path
+
+fragment_path = Path(sys.argv[1])
+settings_path = Path(sys.argv[2])
+marker = sys.argv[3]
+
+with fragment_path.open() as f:
+    fragment = json.load(f)
+
+settings = {}
+if settings_path.exists():
+    try:
+        with settings_path.open() as f:
+            settings = json.load(f)
+    except json.JSONDecodeError:
+        sys.stderr.write(f"error: {settings_path} is not valid JSON\n")
+        sys.exit(1)
+if not isinstance(settings, dict):
+    sys.stderr.write(f"error: {settings_path} is not a JSON object\n")
+    sys.exit(1)
+
+hooks = settings.setdefault("hooks", {})
+if not isinstance(hooks, dict):
+    sys.stderr.write(f"error: 'hooks' in {settings_path} is not an object\n")
+    sys.exit(1)
+
+def has_our_cmd(group):
+    if not isinstance(group, dict):
+        return False
+    for h in group.get("hooks", []) or []:
+        if isinstance(h, dict) and marker in (h.get("command") or ""):
+            return True
+    return False
+
+for event, new_groups in fragment.items():
+    existing = hooks.setdefault(event, [])
+    if not isinstance(existing, list):
+        existing = []
+        hooks[event] = existing
+    if any(has_our_cmd(g) for g in existing):
+        continue
+    for g in new_groups:
+        existing.append(g)
+
+settings_path.parent.mkdir(parents=True, exist_ok=True)
+with settings_path.open("w") as f:
+    json.dump(settings, f, indent=2)
+    f.write("\n")
+PY
+}
+
+# Strip kibitz-installed hook entries from ~/.claude/settings.json.
+unmerge_settings() {
+  python3 - "$SETTINGS_FILE" "$HOOK_SCRIPT_NAME" <<'PY'
+import json, sys
+from pathlib import Path
+
+settings_path = Path(sys.argv[1])
+marker = sys.argv[2]
+
+if not settings_path.exists():
+    sys.exit(0)
+try:
+    with settings_path.open() as f:
+        settings = json.load(f)
+except json.JSONDecodeError:
+    sys.stderr.write(f"warning: {settings_path} is not valid JSON; leaving untouched\n")
+    sys.exit(0)
+if not isinstance(settings, dict):
+    sys.exit(0)
+
+hooks = settings.get("hooks")
+if not isinstance(hooks, dict):
+    sys.exit(0)
+
+changed = False
+for event in list(hooks.keys()):
+    groups = hooks.get(event)
+    if not isinstance(groups, list):
+        continue
+    kept_groups = []
+    for group in groups:
+        if not isinstance(group, dict):
+            kept_groups.append(group)
+            continue
+        inner = group.get("hooks")
+        if not isinstance(inner, list):
+            kept_groups.append(group)
+            continue
+        kept_inner = []
+        for h in inner:
+            if isinstance(h, dict) and marker in (h.get("command") or ""):
+                changed = True
+                continue
+            kept_inner.append(h)
+        if not kept_inner:
+            changed = True
+            continue
+        new_group = dict(group)
+        new_group["hooks"] = kept_inner
+        kept_groups.append(new_group)
+    if kept_groups:
+        if kept_groups != groups:
+            hooks[event] = kept_groups
+            changed = True
+    else:
+        del hooks[event]
+        changed = True
+
+if not hooks:
+    del settings["hooks"]
+    changed = True
+
+if changed:
+    with settings_path.open("w") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+PY
+}
+
+cmd_install() {
+  command -v python3 >/dev/null 2>&1 \
+    || die "python3 is required on PATH (needed by the Stop hook and settings merge)"
+
+  local src_dir bridge_src hook_src hook_json_src launcher_src claude_agent_src codex_role_src
+  if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
+    src_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  else
+    # Invoked via `curl | bash` — no local file to resolve siblings from.
+    # Fetch the repo tarball into a tempdir and install from there.
+    src_dir=$(mktemp -d)
+    trap "rm -rf '$src_dir'" EXIT
+    bootstrap_into "$src_dir"
+  fi
+  bridge_src="$src_dir/scripts/tmux-bridge"
+  hook_src="$src_dir/hooks/$HOOK_SCRIPT_NAME"
+  hook_json_src="$src_dir/hooks/$HOOK_JSON_NAME"
+  launcher_src="$src_dir/scripts/$LAUNCHER_NAME"
+  claude_agent_src="$src_dir/agents/$CLAUDE_AGENT_FILE"
+  codex_role_src="$src_dir/instructions/$CODEX_ROLE_FILE"
+
+  [[ -f "$bridge_src" ]]       || die "tmux-bridge not found: $bridge_src"
+  [[ -f "$hook_src" ]]         || die "hook script not found: $hook_src"
+  [[ -f "$hook_json_src" ]]    || die "hook JSON fragment not found: $hook_json_src"
+  [[ -f "$launcher_src" ]]     || die "reviewer launcher not found: $launcher_src"
+  [[ -f "$claude_agent_src" ]] || die "claude reviewer agent not found: $claude_agent_src"
+  [[ -f "$codex_role_src" ]]   || die "codex reviewer instructions not found: $codex_role_src"
+
+  mkdir -p "$INSTALL_DIR"
+
+  info "Installing tmux-bridge to $INSTALL_DIR/tmux-bridge"
+  copy_script "$bridge_src" "$INSTALL_DIR/tmux-bridge"
+
+  info "Installing kibitz to $INSTALL_DIR/kibitz"
+  copy_script "${BASH_SOURCE[0]}" "$INSTALL_DIR/kibitz"
+
+  info "Installing hook script to $INSTALL_DIR/$HOOK_SCRIPT_NAME"
+  copy_script "$hook_src" "$INSTALL_DIR/$HOOK_SCRIPT_NAME"
+
+  info "Installing reviewer launcher to $INSTALL_DIR/$LAUNCHER_NAME"
+  copy_script "$launcher_src" "$INSTALL_DIR/$LAUNCHER_NAME"
+
+  info "Installing codex reviewer instructions to $CODEX_ROLE_DIR/$CODEX_ROLE_FILE"
+  mkdir -p "$CODEX_ROLE_DIR"
+  cp "$codex_role_src" "$CODEX_ROLE_DIR/$CODEX_ROLE_FILE"
+
+  info "Installing claude reviewer agent to $CLAUDE_AGENTS_DIR/$CLAUDE_AGENT_FILE"
+  mkdir -p "$CLAUDE_AGENTS_DIR"
+  cp "$claude_agent_src" "$CLAUDE_AGENTS_DIR/$CLAUDE_AGENT_FILE"
+
+  info "Merging Stop hook into $SETTINGS_FILE"
+  merge_settings "$hook_json_src" || die "settings merge failed"
+
+  ensure_path "$INSTALL_DIR"
+
+  # Warn (not error) about missing agent binaries.
+  local missing=()
+  for agent in codex claude; do
+    command -v "$agent" >/dev/null 2>&1 || missing+=("$agent")
+  done
+  if (( ${#missing[@]} > 0 )); then
+    warn "Missing agent binaries on PATH: ${missing[*]}"
+    warn "You can still use kibitz with whichever agent is available."
+  fi
+
+  # If current shell doesn't already have INSTALL_DIR on PATH, remind.
+  if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
+    echo ""
+    warn "Open a new shell, or run: export PATH=\"$INSTALL_DIR:\$PATH\""
+  fi
+
+  echo ""
+  info "Done. Try: $(basename "$0") status"
+}
+
+# ---------- runtime commands ----------
+cmd_status() {
+  local match
+  match=$(find_reviewer_pane)
+  if [[ -z "$match" ]]; then
+    echo "kibitz: not running in this window (no pane with a known reviewer label)"
+    warn_if_no_bridge
+    return 1
+  fi
+  local pane label panel_info
+  pane=$(echo "$match" | awk '{print $1}')
+  label=$(echo "$match" | awk '{print $2}')
+  panel_info=$(tmux display-message -t "$pane" -p \
+    '#{session_name}:#{window_index}.#{pane_index} (#{pane_width}x#{pane_height})' 2>/dev/null || true)
+  echo "kibitz: running as '$label' on pane $pane — $panel_info"
+  warn_if_no_bridge
+}
+
+cmd_start() {
+  in_tmux || die "not inside a tmux session (\$TMUX is unset)"
+
+  local existing
+  existing=$(find_reviewer_pane)
+  if [[ -n "$existing" ]]; then
+    local pane label
+    pane=$(echo "$existing" | awk '{print $1}')
+    label=$(echo "$existing" | awk '{print $2}')
+    echo "kibitz: already running in this window as '$label' on pane $pane. Use 'stop' or 'restart' to reset."
+    warn_if_no_bridge
+    return 0
+  fi
+
+  local agent binary label
+  agent=$(pick_reviewer_agent "${1:-}")
+  binary=$(agent_binary "$agent")
+  label=$(agent_label "$agent")
+
+  command -v "$binary" >/dev/null 2>&1 || die "'$binary' not found in PATH"
+
+  local launch_cmd
+  if command -v "$LAUNCHER_NAME" >/dev/null 2>&1; then
+    launch_cmd="$LAUNCHER_NAME $agent"
+  else
+    warn "'$LAUNCHER_NAME' not on PATH — launching $binary without reviewer role prompt (run 'kibitz install' to fix)"
+    launch_cmd="$binary"
+  fi
+
+  local new_pane
+  new_pane=$(tmux split-window -h -P -F '#{pane_id}' "$launch_cmd")
+  tmux set-option -p -t "$new_pane" @name "$label" >/dev/null
+
+  cat <<BANNER
+kibitz: started '$agent' on pane $new_pane (labeled '$label').
+
+A kibitz reviewer is now watching this session from an adjacent tmux pane. Your user/assistant exchanges are forwarded to it automatically via a Stop hook — nothing to do on your end. By default the reviewer keeps its opinions in its own pane.
+
+Occasionally the reviewer may relay a message back into this pane. When that happens it arrives with an smux header:
+
+    [tmux-bridge from:$label pane:$new_pane at:<session>:<win>.<pane> — load the smux skill to reply]
+
+Treat anything with that header as input from the reviewer (via kibitz), not from the user. Anything without it is real user input.
+BANNER
+
+  warn_if_no_bridge
+}
+
+cmd_stop() {
+  local match
+  match=$(find_reviewer_pane)
+  if [[ -z "$match" ]]; then
+    echo "kibitz: not running in this window"
+    return 0
+  fi
+  local pane label
+  pane=$(echo "$match" | awk '{print $1}')
+  label=$(echo "$match" | awk '{print $2}')
+  tmux kill-pane -t "$pane"
+  echo "kibitz: stopped (was '$label' on pane $pane)"
+}
+
+cmd_restart() {
+  cmd_stop || true
+  cmd_start "${1:-}"
+}
+
+cmd_uninstall() {
+  if command -v python3 >/dev/null 2>&1; then
+    info "Removing kibitz hook entries from $SETTINGS_FILE"
+    unmerge_settings
+  else
+    warn "python3 not found; remove kibitz entries from $SETTINGS_FILE manually"
+  fi
+
+  local removed=()
+  for f in \
+    "$INSTALL_DIR/$HOOK_SCRIPT_NAME" \
+    "$INSTALL_DIR/kibitz" \
+    "$INSTALL_DIR/tmux-bridge" \
+    "$INSTALL_DIR/$LAUNCHER_NAME" \
+    "$CODEX_ROLE_DIR/$CODEX_ROLE_FILE" \
+    "$CLAUDE_AGENTS_DIR/$CLAUDE_AGENT_FILE" \
+    "$HOOK_LOG_PATH"
+  do
+    if [[ -e "$f" ]]; then
+      rm -f "$f"
+      removed+=("$f")
+    fi
+  done
+
+  if (( ${#removed[@]} > 0 )); then
+    info "Removed: ${removed[*]}"
+  else
+    info "Nothing to remove."
+  fi
+
+  info "Done."
+}
+
+usage() {
+  cat <<EOF
+kibitz — run a sidecar reviewer agent (codex or claude) in a tmux split pane.
+
+Usage: $(basename "$0") {install|uninstall|start [agent]|stop|status|restart [agent]}
+
+Commands:
+  install          Install tmux-bridge, kibitz, and the Stop hook script
+                   into $INSTALL_DIR, merge the Stop hook entry into
+                   $SETTINGS_FILE, and ensure $INSTALL_DIR is on PATH.
+                   Requires python3. Warns if codex/claude binaries are missing.
+                   Run from a checkout of this repo.
+  uninstall        Remove the Stop hook entry from $SETTINGS_FILE and delete
+                   all installed scripts (kibitz, tmux-bridge, hook script).
+  start [agent]    Split the current tmux window and launch a reviewer agent.
+                   If 'agent' is omitted, auto-detects the host agent and
+                   spawns the other one:
+                     CLAUDECODE=1 (host is Claude Code)    -> spawns codex
+                     ancestor process is codex             -> spawns claude
+                     unknown                               -> error
+                   Valid agents: codex, claude.
+                   No-op if a reviewer is already running in this window;
+                   other windows get their own independent reviewer.
+  stop             Kill the current reviewer pane (whichever agent).
+  status           Print whether a reviewer is running and where.
+  restart [agent]  Stop then start (optionally switching agents).
+
+Environment:
+  NO_COLOR    If set, suppress ANSI color output.
+EOF
+}
+
+[[ $# -eq 0 ]] && { usage; exit 0; }
+
+case "$1" in
+  install)   shift; cmd_install ;;
+  uninstall) shift; cmd_uninstall ;;
+  start)     shift; cmd_start "${1:-}" ;;
+  stop)      shift; cmd_stop ;;
+  status)    shift; cmd_status ;;
+  restart)   shift; cmd_restart "${1:-}" ;;
+  -h|--help|help) usage ;;
+  *) echo "unknown command: $1" >&2; usage; exit 2 ;;
+esac

@@ -1,0 +1,9 @@
+{
+  "Stop": [
+    {
+      "hooks": [
+        { "type": "command", "command": "$HOME/.local/bin/kibitz_hook_stop.py" }
+      ]
+    }
+  ]
+}
