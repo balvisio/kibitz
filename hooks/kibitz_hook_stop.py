@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """kibitz_hook_stop — Claude Code Stop hook that forwards the latest exchange
-to a kibitz reviewer pane (codex or claude-reviewer) via tmux-bridge.
+to a kibitz reviewer pane (codex or claude-reviewer) via tmux-bridge, and also
+stashes the host's last_assistant_message for manual `kibitz relay`.
 
 Invoked with the hook payload on stdin. Exits 0 unconditionally so hook
 failures never block the session; errors go to ~/.claude/kibitz-hook.log.
 
 Directives on the user's message:
   - "/mute" (trailing) — this exchange is not forwarded.
-  - "/dup"  (trailing) — the user text was already forwarded at submit time by
+  - "/tee"  (trailing) — the user text was already forwarded at submit time by
     kibitz_hook_user_prompt_submit.py; the reply is intentionally not sent.
 
 Replies to reviewer-originated messages (those carrying a '[kibitz from:...]'
@@ -16,6 +17,7 @@ ping-pong loops.
 """
 import hashlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -31,6 +33,40 @@ from kibitz_hook_common import (
     parse_directive,
     resolve_reviewer,
 )
+
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "kibitz"
+
+
+def stash_host_turn(pane_id, payload):
+    """Atomically write last_assistant_message to claude-<pane>.msg so a
+    manual `kibitz relay` from the same host pane can forward it to the
+    reviewer. Keyed on $TMUX_PANE because Claude Code — unlike codex — does
+    not export a session/thread ID into child shells, so pane_id is the only
+    stable identifier a spawned shell can observe.
+
+    Best-effort: any failure is logged and swallowed so the stash cannot
+    break the Stop hook's primary job (forwarding exchanges)."""
+    raw = payload.get("last_assistant_message") if isinstance(payload, dict) else None
+    if not isinstance(raw, str) or not raw.strip():
+        return
+
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log(f"stash: cache dir create failed: {e}")
+        return
+
+    key = pane_id.lstrip("%")
+    msg_path = CACHE_DIR / f"claude-{key}.msg"
+    tmp_path = msg_path.with_suffix(".msg.tmp")
+    session_id = payload.get("session_id", "") if isinstance(payload, dict) else ""
+    body = {"turn_id": session_id, "session_id": session_id, "message": raw}
+    try:
+        with tmp_path.open("w") as f:
+            json.dump(body, f)
+        tmp_path.replace(msg_path)
+    except Exception as e:
+        log(f"stash: write failed for {msg_path}: {e}")
 
 
 def latest_user_prompt(transcript_path):
@@ -73,6 +109,17 @@ def main():
         log(f"bad stdin json: {e}")
         return 0
 
+    pane_label = current_pane_label()
+    my_pane = os.environ.get("TMUX_PANE", "")
+
+    # Stash the host's last_assistant_message for manual `kibitz relay`. Runs
+    # before any transcript/forward preconditions so relay still works when
+    # automatic forwarding is skipped (muted, deduped, reviewer pane gone).
+    # Scoped to non-reviewer panes: stashing a reviewer's own reply isn't
+    # wired into the relay flow and would just litter the cache dir.
+    if my_pane and pane_label not in REVIEWER_LABELS:
+        stash_host_turn(my_pane, payload)
+
     transcript = payload.get("transcript_path")
     if not transcript:
         return 0
@@ -80,7 +127,7 @@ def main():
     if not tpath.is_file():
         return 0
 
-    if current_pane_label() in REVIEWER_LABELS:
+    if pane_label in REVIEWER_LABELS:
         return 0
 
     reviewer = resolve_reviewer()
@@ -99,9 +146,9 @@ def main():
         return 0
 
     user_text, directive = parse_directive(user_text_raw)
-    # /mute: drop this exchange. /dup: user text was already forwarded at
+    # /mute: drop this exchange. /tee: user text was already forwarded at
     # submit time; skip the Stop-time forward so the reviewer never sees the
-    # reply for it. Option B falls out of this too: a bare /mute or /dup leaves
+    # reply for it. Option B falls out of this too: a bare /mute or /tee leaves
     # user_text empty with a directive set, and we return here.
     if directive:
         return 0

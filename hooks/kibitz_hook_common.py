@@ -13,10 +13,10 @@ REVIEWER_LABELS = ("codex", "claude-reviewer")
 LOG_PATH = Path.home() / ".claude" / "kibitz-hook.log"
 LAST_FORWARD_PATH = Path.home() / ".claude" / "kibitz-last.txt"
 
-# Case-sensitive. /MUTE, /Dup, etc. fall through as normal text — keeping the
+# Case-sensitive. /MUTE, /Tee, etc. fall through as normal text — keeping the
 # surface area narrow avoids accidentally swallowing content that merely
 # resembles a directive.
-KIBITZ_DIRECTIVES = ("/mute", "/dup")
+KIBITZ_DIRECTIVES = ("/mute", "/tee")
 
 # User-entry content that isn't a real prompt (Claude Code local-command
 # artifacts, tool errors, slash commands). Any user entry whose stripped text
@@ -62,7 +62,7 @@ def extract_text(content):
 
 def is_skippable_user_text(text):
     """Return True for user entries that aren't real prompts (tool results,
-    bash wrappers, Claude Code slash commands). A bare /mute or /dup is *not*
+    bash wrappers, Claude Code slash commands). A bare /mute or /tee is *not*
     skipped — parse_directive in the caller handles those."""
     s = text.lstrip()
     if not s:
@@ -84,7 +84,7 @@ def is_reviewer_originated(text):
 
 
 def parse_directive(text):
-    """Return (cleaned_text, directive) where directive is "mute", "dup", or "".
+    """Return (cleaned_text, directive) where directive is "mute", "tee", or "".
 
     Directives must appear at the very end of the message, preceded by
     whitespace or be the entire message — so `path/to/mute` or `/muted` don't

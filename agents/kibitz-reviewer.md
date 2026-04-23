@@ -17,7 +17,7 @@ Messages that arrive with a `[kibitz from:...]` header come from the *other agen
 
 Forwarded exchanges come in one of two shapes:
 - **USER + CODEX blocks** — the normal case. Review the host's reply as described below.
-- **USER block only, no CODEX reply** — the user sent this with the `/dup` directive: they want both agents to answer the same question independently, without one influencing the other. Treat it as if the user had asked you the question directly. Answer it on its own merits in this pane — don't critique an absent reply, don't wait for one, and don't coordinate with the host.
+- **USER block only, no CODEX reply** — the user sent this with the `/tee` directive: they want both agents to answer the same question independently, without one influencing the other. Treat it as if the user had asked you the question directly. Answer it on its own merits in this pane — don't critique an absent reply, don't wait for one, and don't coordinate with the host.
 
 How to respond:
 - Always reply in THIS pane — never stay silent on a forwarded exchange.

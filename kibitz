@@ -579,7 +579,7 @@ Occasionally the reviewer may relay a message back into this pane (via 'kibitz s
 
 Treat anything with that header as input from the reviewer, not from the user. Anything without it is real user input.
 
-If a user message ends with '/mute' or '/dup', those are kibitz directives consumed by the hooks — NOT Claude Code slash commands or skills. Do not try to invoke them. Handle the rest of the message normally and treat the trailing directive as absent.
+If a user message ends with '/mute' or '/tee', those are kibitz directives consumed by the hooks — NOT Claude Code slash commands or skills. Do not try to invoke them. Handle the rest of the message normally and treat the trailing directive as absent.
 BANNER
 
   warn_if_no_bridge
@@ -647,34 +647,37 @@ cmd_send() {
   _relay_to_host "$*"
 }
 
-# Forward codex's last assistant reply to the host pane. Payload comes from
-# the codex Stop hook (~/.cache/kibitz/codex-<CODEX_THREAD_ID>.msg); we key
-# lookup on CODEX_THREAD_ID which codex exports into the shell it spawns.
-# No dedupe — running `relay` twice sends twice, matching the user's Unix
-# intuition that manual commands do what they say each time they're run.
-cmd_relay() {
+# Parallel to _relay_to_host for the host → reviewer direction. Only claude
+# is supported as a host today, so the header is fixed to [kibitz from:claude].
+# Finds the reviewer via find_reviewer_pane (scoped to the current window).
+_relay_to_reviewer() {
+  local text="$1"
   in_tmux || die "not inside a tmux session (\$TMUX is unset)"
+  [[ -n "$text" ]] || die "empty message — nothing to relay"
 
-  local my_label
-  my_label=$(tmux display-message -p '#{@name}' 2>/dev/null || true)
-  [[ "$my_label" == "codex" ]] \
-    || die "relay is only supported in the codex reviewer pane (this pane label: '${my_label:-<unset>}')"
+  local reviewer_line
+  reviewer_line=$(find_reviewer_pane)
+  [[ -n "$reviewer_line" ]] \
+    || die "no reviewer pane in this window — run '$(basename "$0") start' first"
+  local reviewer_pane="${reviewer_line%% *}"
 
-  local thread_id="${CODEX_THREAD_ID:-}"
-  [[ -n "$thread_id" ]] \
-    || die "CODEX_THREAD_ID is not set — is this shell running inside codex?"
+  tmux display-message -t "$reviewer_pane" -p '#{pane_id}' >/dev/null 2>&1 \
+    || die "reviewer pane $reviewer_pane no longer exists — run '$(basename "$0") restart'"
 
-  local msg_path="$KIBITZ_CACHE_DIR/codex-$thread_id.msg"
+  has_bridge || die "tmux-bridge not found in PATH (run: $(basename "$0") install)"
 
-  [[ -f "$msg_path" ]] \
-    || die "no relay payload at $msg_path — wait for codex to finish a turn (the Stop hook writes this), then retry"
+  tmux-bridge read "$reviewer_pane" 1 >/dev/null
+  tmux-bridge message --header "[kibitz from:claude]" "$reviewer_pane" "$text"
+  tmux-bridge read "$reviewer_pane" 1 >/dev/null
+  tmux-bridge keys "$reviewer_pane" Enter
+}
 
-  # Read turn_id and message out of the JSON payload in one shot. turn_id is
-  # a single line (UUID) so we can separate it from the free-form message
-  # with a single newline delimiter. The trailing __KIBITZ_EOF__ marker
-  # exists because bash command substitution strips trailing newlines; a
-  # message ending in blank lines (or a closing ``` on its own line) would
-  # otherwise be silently truncated en route to the host.
+# Parse the two-field JSON stashed by the Stop hooks ({turn_id, message}).
+# The trailing __KIBITZ_EOF__ marker preserves trailing newlines/blank lines
+# that bash command substitution would otherwise strip (e.g. a message ending
+# in a closing ``` on its own line).
+_load_relay_payload() {
+  local msg_path="$1" turn_var="$2" msg_var="$3"
   local parsed
   parsed=$(python3 - "$msg_path" <<'PY' && printf '__KIBITZ_EOF__'
 import json, sys
@@ -685,15 +688,60 @@ sys.stdout.write(data.get("message") or "")
 PY
   ) || die "failed to parse $msg_path"
   parsed="${parsed%__KIBITZ_EOF__}"
+  printf -v "$turn_var" '%s' "${parsed%%$'\n'*}"
+  printf -v "$msg_var"  '%s' "${parsed#*$'\n'}"
+}
 
-  local turn_id="${parsed%%$'\n'*}"
-  local message="${parsed#*$'\n'}"
+# Forward the agent's own last assistant reply to its counterpart pane.
+# Dispatches on the current pane label:
+#   codex reviewer → claude host. Payload at ~/.cache/kibitz/codex-<CODEX_THREAD_ID>.msg
+#     (written by the codex Stop hook, keyed on CODEX_THREAD_ID which codex
+#     exports into the reviewer shell).
+#   claude host    → codex reviewer. Payload at ~/.cache/kibitz/claude-<pane>.msg
+#     (written by the Claude Stop hook, keyed on $TMUX_PANE — Claude doesn't
+#     export a thread/session id into spawned shells, so pane id is the only
+#     stable key the running shell can also observe).
+# No dedupe — running `relay` twice sends twice, matching the user's Unix
+# intuition that manual commands do what they say each time they're run.
+cmd_relay() {
+  in_tmux || die "not inside a tmux session (\$TMUX is unset)"
 
+  local my_pane="${TMUX_PANE:-}"
+  [[ -n "$my_pane" ]] || die "\$TMUX_PANE is unset"
+
+  local my_label
+  my_label=$(tmux display-message -t "$my_pane" -p '#{@name}' 2>/dev/null || true)
+
+  local msg_path direction
+  if [[ "$my_label" == "codex" ]]; then
+    local thread_id="${CODEX_THREAD_ID:-}"
+    [[ -n "$thread_id" ]] \
+      || die "CODEX_THREAD_ID is not set — is this shell running inside codex?"
+    msg_path="$KIBITZ_CACHE_DIR/codex-$thread_id.msg"
+    direction="to_host"
+  elif [[ "$my_label" == "claude-reviewer" ]]; then
+    die "relay from a claude-reviewer pane is not supported — only codex reviewer → host and claude host → codex reviewer are wired"
+  else
+    # Any non-reviewer pane: treat as a claude host. The stash is keyed on
+    # this pane's id, so two claude hosts across windows never collide.
+    msg_path="$KIBITZ_CACHE_DIR/claude-${my_pane#%}.msg"
+    direction="to_reviewer"
+  fi
+
+  [[ -f "$msg_path" ]] \
+    || die "no relay payload at $msg_path — wait for the agent to finish a turn (the Stop hook writes this), then retry"
+
+  local turn_id message
+  _load_relay_payload "$msg_path" turn_id message
   [[ -n "$message" ]] || die "no 'message' field in $msg_path"
 
-  _relay_to_host "$message"
-
-  info "relayed codex turn ${turn_id:-<no-id>} to host"
+  if [[ "$direction" == "to_host" ]]; then
+    _relay_to_host "$message"
+    info "relayed codex turn ${turn_id:-<no-id>} to host"
+  else
+    _relay_to_reviewer "$message"
+    info "relayed claude turn ${turn_id:-<no-id>} to reviewer"
+  fi
 }
 
 cmd_uninstall() {
@@ -776,9 +824,12 @@ Commands:
                    with a minimal '[kibitz from:<agent>]' header. Routes via the
                    pane-local @kibitz_host_pane option set at start time, so
                    concurrent reviewer pairs in different windows don't cross.
-  relay            Codex reviewer only. Forward codex's own last assistant reply
-                   verbatim to the host pane, using the payload the codex Stop
-                   hook stashed in \$XDG_CACHE_HOME/kibitz/codex-<thread>.msg.
+  relay            Forward the agent's own last assistant reply verbatim to
+                   its counterpart pane. Dispatches on the current pane:
+                     codex reviewer → claude host (payload keyed on
+                       CODEX_THREAD_ID, stashed by the codex Stop hook).
+                     claude host    → codex reviewer (payload keyed on
+                       \$TMUX_PANE, stashed by the Claude Stop hook).
                    No dedupe: running 'relay' twice sends twice.
 
 Environment:

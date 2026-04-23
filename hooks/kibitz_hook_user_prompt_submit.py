@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """kibitz_hook_user_prompt_submit — Claude Code UserPromptSubmit hook: when
-the user's prompt ends with the "/dup" directive, immediately forward the
-stripped prompt to the kibitz reviewer pane. The Stop hook drops /dup-tagged
+the user's prompt ends with the "/tee" directive, immediately forward the
+stripped prompt to the kibitz reviewer pane. The Stop hook drops /tee-tagged
 exchanges on the reply side, so the reviewer sees only the user's message.
 
 Invoked with the hook payload on stdin. Exits 0 unconditionally so hook
@@ -32,9 +32,9 @@ def main():
         return 0
 
     cleaned, directive = parse_directive(prompt)
-    if directive != "dup":
+    if directive != "tee":
         return 0
-    # Option B: bare "/dup" is a no-op, not a forward-empty-body.
+    # Option B: bare "/tee" is a no-op, not a forward-empty-body.
     if not cleaned:
         return 0
 
