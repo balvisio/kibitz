@@ -10,10 +10,15 @@ agent="${1:?usage: kibitz_reviewer_launch [codex|claude]}"
 case "$agent" in
   codex)
     role_file="$HOME/.codex/systemprompts/kibitz-reviewer.md"
+    # network_access=true punches a hole in codex's workspace-write seatbelt
+    # for outbound sockets — without it, tmux(1) inside this pane can't reach
+    # /private/tmp/tmux-*/default, so `kibitz send`/`status` silently fail.
     if [[ -f "$role_file" ]]; then
-      exec codex --config developer_instructions="$(<"$role_file")"
+      exec codex \
+        --config sandbox_workspace_write.network_access=true \
+        --config developer_instructions="$(<"$role_file")"
     fi
-    exec codex
+    exec codex --config sandbox_workspace_write.network_access=true
     ;;
   claude)
     if [[ -f "$HOME/.claude/agents/kibitz-reviewer.md" ]]; then

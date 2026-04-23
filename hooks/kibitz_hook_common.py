@@ -5,6 +5,7 @@ alongside them in ~/.local/bin/ after install; Python's default sys.path[0]
 (the invoked script's directory) makes `import kibitz_hook_common` resolve.
 """
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -73,6 +74,15 @@ def is_skippable_user_text(text):
     return s.startswith(_SKIP_USER_PREFIXES)
 
 
+def is_reviewer_originated(text):
+    """Return True if the user message was relayed from the reviewer via
+    `kibitz send` — those carry a '[kibitz from:<agent>]' header. Replies to
+    such messages should not be forwarded back: the reviewer already saw its
+    own outbound text, and a round-trip produces a ping-pong loop with no new
+    information."""
+    return text.lstrip().startswith("[kibitz from:")
+
+
 def parse_directive(text):
     """Return (cleaned_text, directive) where directive is "mute", "dup", or "".
 
@@ -89,10 +99,18 @@ def parse_directive(text):
 
 
 def current_pane_label():
+    # Target $TMUX_PANE explicitly: `display-message -p` without `-t` returns
+    # the *focused* pane's @name, so when the reviewer pane has focus (e.g.
+    # right after `kibitz send`), the host's hook would see the reviewer label
+    # and bail out thinking it was running inside the reviewer.
+    pane = os.environ.get("TMUX_PANE", "")
+    cmd = ["tmux", "display-message", "-p"]
+    if pane:
+        cmd += ["-t", pane]
+    cmd += ["#{@name}"]
     try:
         r = subprocess.run(
-            ["tmux", "display-message", "-p", "#{@name}"],
-            capture_output=True, text=True, check=True, timeout=5,
+            cmd, capture_output=True, text=True, check=True, timeout=5,
         )
         return r.stdout.strip()
     except Exception:

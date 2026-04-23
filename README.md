@@ -8,7 +8,9 @@ Named after the Yiddish *kibbitzer* — the spectator who can't resist offering 
 
 - `kibitz start` splits the current tmux window (vertical divider), launches the reviewer agent in the new pane, labels the pane via smux (`codex` or `claude-reviewer`).
 - A Claude Code `Stop` hook extracts the latest user + assistant turn from the session transcript and forwards them to the reviewer pane using `tmux-bridge`.
-- The reviewer sends messages back via `kibitz send "<text>"`, which prepends a minimal `[kibitz from:<agent>]` header (e.g. `[kibitz from:codex]`) so the host agent can tell them apart from real user input.
+- The reviewer sends messages back two ways, both prepend a `[kibitz from:<agent>]` header so the host can tell them apart from real user input:
+  - `kibitz send "<text>"` — send custom text.
+  - `kibitz relay` (codex reviewer only) — forward codex's own last assistant reply verbatim. A codex `Stop` hook stashes `last_assistant_message` in `$XDG_CACHE_HOME/kibitz/codex-<thread>.msg` at the end of each codex turn; `relay` reads that file and forwards it. No dedupe — running `relay` twice on the same turn sends twice.
 - `kibitz stop` / `kibitz restart` / `kibitz status` manage the pane lifecycle.
 - `kibitz uninstall` tears everything down cleanly.
 
@@ -69,10 +71,11 @@ From a checkout of this repo:
 What install does:
 
 1. Verifies `python3` is on PATH.
-2. Copies `scripts/tmux-bridge`, `kibitz`, and the `hooks/kibitz_hook_*.py` scripts into `~/.local/bin/`.
+2. Copies `scripts/tmux-bridge`, `kibitz`, and the `hooks/kibitz_*.py` scripts (Claude hooks + `kibitz_codex_stop.py`) into `~/.local/bin/`.
 3. Merges the Stop and UserPromptSubmit hook entries from `hooks/kibitz_hook.json` into `~/.claude/settings.json` (idempotent — won't duplicate on reinstall, preserves any other hooks you have).
-4. Adds `~/.local/bin/` to `PATH` in your shell rc (`.zshrc` / `.bashrc` / `.profile`) if it isn't already.
-5. Warns if `codex` or `claude` binaries are missing (non-fatal).
+4. Merges the codex Stop hook from `hooks/kibitz_codex_hooks.json` into `~/.codex/hooks.json` (same idempotent behavior), and sets `[features] codex_hooks = true` in `~/.codex/config.toml` so codex actually fires hooks. If `codex_hooks` is already set to `false` the installer warns and leaves it alone.
+5. Adds `~/.local/bin/` to `PATH` in your shell rc (`.zshrc` / `.bashrc` / `.profile`) if it isn't already.
+6. Warns if `codex` or `claude` binaries are missing (non-fatal).
 
 `tmux-bridge` is vendored from [`ShawnPana/smux`](https://github.com/ShawnPana/smux) under `scripts/`.
 
@@ -96,7 +99,13 @@ kibitz status
 # Stop + start, optionally switching agents.
 kibitz restart claude
 
-# Remove the Stop hook entry and delete all installed scripts.
+# From inside the codex reviewer pane: forward codex's own last reply
+# verbatim back to the host pane (with [kibitz from:codex] header).
+# Fails if no codex turn has been stashed yet. Running it twice sends
+# twice — there's no dedupe.
+kibitz relay
+
+# Remove the Stop hook entries and delete all installed scripts.
 kibitz uninstall
 ```
 
@@ -116,10 +125,12 @@ tmux-bridge keys codex Enter            # press Enter in the reviewer pane
 kibitz/
 ├── kibitz                      # the management script (bash)
 ├── hooks/
-│   ├── kibitz_hook_stop.py                 # Stop hook — forwards user/assistant exchange
-│   ├── kibitz_hook_user_prompt_submit.py   # UserPromptSubmit hook — implements `/dup`
-│   ├── kibitz_hook_common.py               # shared helpers imported by both hooks
-│   └── kibitz_hook.json                    # settings.json fragment `install` merges in
+│   ├── kibitz_hook_stop.py                 # Claude Code Stop hook — forwards user/assistant exchange
+│   ├── kibitz_hook_user_prompt_submit.py   # Claude Code UserPromptSubmit hook — implements `/dup`
+│   ├── kibitz_hook_common.py               # shared helpers imported by both Claude hooks
+│   ├── kibitz_hook.json                    # settings.json fragment `install` merges in
+│   ├── kibitz_codex_stop.py                # Codex Stop hook — stashes last_assistant_message for `kibitz relay`
+│   └── kibitz_codex_hooks.json             # ~/.codex/hooks.json fragment `install` merges in
 ├── scripts/
 │   └── tmux-bridge             # vendored from ShawnPana/smux
 ├── LICENSE
@@ -134,6 +145,7 @@ After install, the runtime copies land in `~/.local/bin/`:
 ├── kibitz_hook_stop.py
 ├── kibitz_hook_user_prompt_submit.py
 ├── kibitz_hook_common.py
+├── kibitz_codex_stop.py
 └── tmux-bridge
 ```
 
@@ -160,10 +172,31 @@ And hook entries are added to `~/.claude/settings.json`:
 }
 ```
 
+And to `~/.codex/hooks.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "$HOME/.local/bin/kibitz_codex_stop.py" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+Plus `[features] codex_hooks = true` in `~/.codex/config.toml` (codex won't fire hooks without it).
+
+At runtime the codex Stop hook writes payloads to `$XDG_CACHE_HOME/kibitz/` (falls back to `~/.cache/kibitz/`) — one `codex-<thread>.msg` file per active codex thread, overwritten at the end of each codex turn. Errors from either hook land in `$XDG_CACHE_HOME/kibitz/log`.
+
 ## Troubleshooting
 
 - **`tmux-bridge not found`** — run `kibitz install`, or check that `~/.local/bin` is on `PATH`.
-- **Hook not forwarding** — check `~/.claude/kibitz-hook.log`. The hook always exits 0 (so it can't block your session), and routes errors there.
+- **Hook not forwarding (Claude side)** — check `~/.claude/kibitz-hook.log`. The hook always exits 0 (so it can't block your session), and routes errors there.
+- **`kibitz relay` says `no relay payload` or `CODEX_THREAD_ID is not set`** — codex hasn't written a payload for this thread yet. Check `$XDG_CACHE_HOME/kibitz/log` (or `~/.cache/kibitz/log`) for codex Stop hook errors. Confirm `[features] codex_hooks = true` in `~/.codex/config.toml` — without it codex won't fire hooks at all.
 - **`couldn't detect host agent`** — host detection is Linux-only (`/proc/$PPID/exe`). On macOS, or when running through an unusual wrapper, pass the agent explicitly: `kibitz start codex`.
 - **Stale reviewer pane** — if `kibitz status` reports a pane that no longer exists, something killed the pane outside of kibitz. Run `kibitz stop` to clear the label, then `kibitz start`.
 
@@ -173,4 +206,4 @@ And hook entries are added to `~/.claude/settings.json`:
 kibitz uninstall
 ```
 
-Removes the hook entry from `~/.claude/settings.json` (preserving any unrelated hooks you added) and deletes `kibitz`, `kibitz_hook_stop.py`, and `tmux-bridge` from `~/.local/bin/`. Leaves `PATH` edits in your shell rc alone.
+Removes the kibitz hook entries from `~/.claude/settings.json` and `~/.codex/hooks.json` (preserving any unrelated hooks you added), deletes `kibitz`, the hook scripts, and `tmux-bridge` from `~/.local/bin/`, and clears `$XDG_CACHE_HOME/kibitz/` (stashed codex payloads and hook log). Leaves `[features] codex_hooks = true` in `~/.codex/config.toml` alone — the flag is harmless with no hooks registered, and disabling it would silently break other hooks you may have added independently. Leaves `PATH` edits in your shell rc alone.

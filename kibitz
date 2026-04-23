@@ -14,10 +14,17 @@ HOOK_SCRIPTS=(
   "kibitz_hook_stop.py"
   "kibitz_hook_user_prompt_submit.py"
   "kibitz_hook_common.py"
+  "kibitz_codex_stop.py"
 )
 HOOK_JSON_NAME="kibitz_hook.json"
+CODEX_HOOK_JSON_NAME="kibitz_codex_hooks.json"
 SETTINGS_FILE="$HOME/.claude/settings.json"
+CODEX_SETTINGS_FILE="$HOME/.codex/hooks.json"
+CODEX_CONFIG_FILE="$HOME/.codex/config.toml"
 HOOK_LOG_PATH="$HOME/.claude/kibitz-hook.log"
+# Shared cache dir used by the codex Stop hook to stash last_assistant_message
+# for `kibitz relay` to pick up. Honors $XDG_CACHE_HOME when set.
+KIBITZ_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/kibitz"
 
 # Reviewer role artifacts. The launcher wraps the agent binary so we can feed
 # the role prompt in at exec time without quoting issues crossing tmux split-window.
@@ -212,8 +219,8 @@ bootstrap_into() {
 # already present under a given event, that event is left alone — so adding or
 # removing hook scripts over time doesn't duplicate or strand entries.
 merge_settings() {
-  local fragment="$1"
-  python3 - "$fragment" "$SETTINGS_FILE" "${HOOK_SCRIPTS[@]}" <<'PY'
+  local fragment="$1" settings_path="$2"
+  python3 - "$fragment" "$settings_path" "${HOOK_SCRIPTS[@]}" <<'PY'
 import json, sys
 from os.path import basename
 from pathlib import Path
@@ -274,9 +281,10 @@ with settings_path.open("w") as f:
 PY
 }
 
-# Strip kibitz-installed hook entries from ~/.claude/settings.json.
+# Strip kibitz-installed hook entries from a settings/hooks JSON file.
 unmerge_settings() {
-  python3 - "$SETTINGS_FILE" "${HOOK_SCRIPTS[@]}" <<'PY'
+  local settings_path="$1"
+  python3 - "$settings_path" "${HOOK_SCRIPTS[@]}" <<'PY'
 import json, sys
 from os.path import basename
 from pathlib import Path
@@ -347,31 +355,102 @@ if changed:
 PY
 }
 
+# Flip `[features] codex_hooks = true` in ~/.codex/config.toml, which gates
+# whether codex actually fires hooks at all. We edit line-based (no TOML writer
+# in the stdlib) rather than round-tripping through a parser — this preserves
+# comments and whitespace in the user's existing config.
+ensure_codex_hooks_feature() {
+  # The Python helper stays silent on success and prints only the warning
+  # detail (no prefix) to stderr on the "set to non-true, left alone" path.
+  # We capture and reformat via bash `warn` so the output stays in our
+  # [kibitz]-prefixed, color-consistent house style.
+  local detail
+  if ! detail=$(python3 - "$CODEX_CONFIG_FILE" <<'PY' 2>&1 >/dev/null
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+
+if not path.exists():
+    path.write_text("[features]\ncodex_hooks = true\n")
+    sys.exit(0)
+
+content = path.read_text()
+lines = content.splitlines()
+
+section = None
+features_line = None
+for i, line in enumerate(lines):
+    stripped = line.strip()
+    m = re.match(r"^\[([^\[\]]+)\]\s*$", stripped)
+    if m:
+        section = m.group(1).strip()
+        if section == "features":
+            features_line = i
+        continue
+    if section == "features":
+        m2 = re.match(r"^\s*codex_hooks\s*=\s*([^\s#]+)", line)
+        if m2:
+            value = m2.group(1).strip()
+            if value == "true":
+                sys.exit(0)
+            sys.stderr.write(
+                f"{path}: codex_hooks is set to {value!r}; leaving unchanged\n"
+            )
+            sys.exit(0)
+
+trailing_newline = content.endswith("\n") or not content
+if features_line is not None:
+    lines.insert(features_line + 1, "codex_hooks = true")
+    new_content = "\n".join(lines)
+    if trailing_newline:
+        new_content += "\n"
+else:
+    prefix = content if trailing_newline else content + "\n"
+    new_content = prefix + "\n[features]\ncodex_hooks = true\n"
+
+path.write_text(new_content)
+PY
+  ); then
+    die "ensure_codex_hooks_feature: python helper failed${detail:+ — $detail}"
+  fi
+  [[ -n "$detail" ]] && warn "$detail"
+  return 0
+}
+
 cmd_install() {
   command -v python3 >/dev/null 2>&1 \
     || die "python3 is required on PATH (needed by the Stop hook and settings merge)"
 
-  local src_dir bridge_src hook_json_src launcher_src claude_agent_src codex_role_src
+  local src_dir kibitz_src bridge_src hook_json_src codex_hook_json_src launcher_src claude_agent_src codex_role_src
   if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
     src_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    kibitz_src="${BASH_SOURCE[0]}"
   else
     # Invoked via `curl | bash` — no local file to resolve siblings from.
     # Fetch the repo tarball into a tempdir and install from there.
+    # (Inside a function under stdin execution, BASH_SOURCE[0] is the literal
+    # string "main", so we cannot use it as the kibitz source path.)
     src_dir=$(mktemp -d)
     trap "rm -rf '$src_dir'" EXIT
     bootstrap_into "$src_dir"
+    kibitz_src="$src_dir/kibitz"
   fi
   bridge_src="$src_dir/scripts/tmux-bridge"
   hook_json_src="$src_dir/hooks/$HOOK_JSON_NAME"
+  codex_hook_json_src="$src_dir/hooks/$CODEX_HOOK_JSON_NAME"
   launcher_src="$src_dir/scripts/$LAUNCHER_NAME"
   claude_agent_src="$src_dir/agents/$CLAUDE_AGENT_FILE"
   codex_role_src="$src_dir/instructions/$CODEX_ROLE_FILE"
 
-  [[ -f "$bridge_src" ]]       || die "tmux-bridge not found: $bridge_src"
-  [[ -f "$hook_json_src" ]]    || die "hook JSON fragment not found: $hook_json_src"
-  [[ -f "$launcher_src" ]]     || die "reviewer launcher not found: $launcher_src"
-  [[ -f "$claude_agent_src" ]] || die "claude reviewer agent not found: $claude_agent_src"
-  [[ -f "$codex_role_src" ]]   || die "codex reviewer instructions not found: $codex_role_src"
+  [[ -f "$bridge_src" ]]          || die "tmux-bridge not found: $bridge_src"
+  [[ -f "$hook_json_src" ]]       || die "hook JSON fragment not found: $hook_json_src"
+  [[ -f "$codex_hook_json_src" ]] || die "codex hook JSON fragment not found: $codex_hook_json_src"
+  [[ -f "$launcher_src" ]]        || die "reviewer launcher not found: $launcher_src"
+  [[ -f "$claude_agent_src" ]]    || die "claude reviewer agent not found: $claude_agent_src"
+  [[ -f "$codex_role_src" ]]      || die "codex reviewer instructions not found: $codex_role_src"
 
   local script hook_src
   for script in "${HOOK_SCRIPTS[@]}"; do
@@ -385,7 +464,7 @@ cmd_install() {
   copy_script "$bridge_src" "$INSTALL_DIR/tmux-bridge"
 
   info "Installing kibitz to $INSTALL_DIR/kibitz"
-  copy_script "${BASH_SOURCE[0]}" "$INSTALL_DIR/kibitz"
+  copy_script "$kibitz_src" "$INSTALL_DIR/kibitz"
 
   for script in "${HOOK_SCRIPTS[@]}"; do
     info "Installing hook script to $INSTALL_DIR/$script"
@@ -404,7 +483,13 @@ cmd_install() {
   cp "$claude_agent_src" "$CLAUDE_AGENTS_DIR/$CLAUDE_AGENT_FILE"
 
   info "Merging kibitz hook entries into $SETTINGS_FILE"
-  merge_settings "$hook_json_src" || die "settings merge failed"
+  merge_settings "$hook_json_src" "$SETTINGS_FILE" || die "settings merge failed"
+
+  info "Merging kibitz codex hook entries into $CODEX_SETTINGS_FILE"
+  merge_settings "$codex_hook_json_src" "$CODEX_SETTINGS_FILE" || die "codex hooks merge failed"
+
+  info "Ensuring [features] codex_hooks = true in $CODEX_CONFIG_FILE"
+  ensure_codex_hooks_feature
 
   ensure_path "$INSTALL_DIR"
 
@@ -425,7 +510,7 @@ cmd_install() {
   fi
 
   echo ""
-  info "Done. Try: $(basename "$0") status"
+  info "Done. Try: kibitz status"
 }
 
 # ---------- runtime commands ----------
@@ -493,6 +578,8 @@ Occasionally the reviewer may relay a message back into this pane (via 'kibitz s
     [kibitz from:$agent] <message>
 
 Treat anything with that header as input from the reviewer, not from the user. Anything without it is real user input.
+
+If a user message ends with '/mute' or '/dup', those are kibitz directives consumed by the hooks — NOT Claude Code slash commands or skills. Do not try to invoke them. Handle the rest of the message normally and treat the trailing directive as absent.
 BANNER
 
   warn_if_no_bridge
@@ -520,12 +607,11 @@ cmd_restart() {
 # Relay a message from the reviewer pane back to its host pane. Reads the
 # host pane ID from the pane-local @kibitz_host_pane option that cmd_start
 # stamped on the reviewer pane — so two windows each with their own
-# claude+codex pair route independently.
-cmd_send() {
+# claude+codex pair route independently. Shared by `send` and `relay`.
+_relay_to_host() {
+  local text="$1"
   in_tmux || die "not inside a tmux session (\$TMUX is unset)"
-
-  local text="$*"
-  [[ -n "$text" ]] || die "usage: $(basename "$0") send <text>"
+  [[ -n "$text" ]] || die "empty message — nothing to relay"
 
   local my_pane="${TMUX_PANE:-}"
   [[ -n "$my_pane" ]] || die "\$TMUX_PANE is unset"
@@ -556,13 +642,73 @@ cmd_send() {
   tmux-bridge keys "$host_pane" Enter
 }
 
+cmd_send() {
+  [[ $# -gt 0 && -n "$*" ]] || die "usage: $(basename "$0") send <text>"
+  _relay_to_host "$*"
+}
+
+# Forward codex's last assistant reply to the host pane. Payload comes from
+# the codex Stop hook (~/.cache/kibitz/codex-<CODEX_THREAD_ID>.msg); we key
+# lookup on CODEX_THREAD_ID which codex exports into the shell it spawns.
+# No dedupe — running `relay` twice sends twice, matching the user's Unix
+# intuition that manual commands do what they say each time they're run.
+cmd_relay() {
+  in_tmux || die "not inside a tmux session (\$TMUX is unset)"
+
+  local my_label
+  my_label=$(tmux display-message -p '#{@name}' 2>/dev/null || true)
+  [[ "$my_label" == "codex" ]] \
+    || die "relay is only supported in the codex reviewer pane (this pane label: '${my_label:-<unset>}')"
+
+  local thread_id="${CODEX_THREAD_ID:-}"
+  [[ -n "$thread_id" ]] \
+    || die "CODEX_THREAD_ID is not set — is this shell running inside codex?"
+
+  local msg_path="$KIBITZ_CACHE_DIR/codex-$thread_id.msg"
+
+  [[ -f "$msg_path" ]] \
+    || die "no relay payload at $msg_path — wait for codex to finish a turn (the Stop hook writes this), then retry"
+
+  # Read turn_id and message out of the JSON payload in one shot. turn_id is
+  # a single line (UUID) so we can separate it from the free-form message
+  # with a single newline delimiter. The trailing __KIBITZ_EOF__ marker
+  # exists because bash command substitution strips trailing newlines; a
+  # message ending in blank lines (or a closing ``` on its own line) would
+  # otherwise be silently truncated en route to the host.
+  local parsed
+  parsed=$(python3 - "$msg_path" <<'PY' && printf '__KIBITZ_EOF__'
+import json, sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text())
+sys.stdout.write((data.get("turn_id") or "") + "\n")
+sys.stdout.write(data.get("message") or "")
+PY
+  ) || die "failed to parse $msg_path"
+  parsed="${parsed%__KIBITZ_EOF__}"
+
+  local turn_id="${parsed%%$'\n'*}"
+  local message="${parsed#*$'\n'}"
+
+  [[ -n "$message" ]] || die "no 'message' field in $msg_path"
+
+  _relay_to_host "$message"
+
+  info "relayed codex turn ${turn_id:-<no-id>} to host"
+}
+
 cmd_uninstall() {
   if command -v python3 >/dev/null 2>&1; then
     info "Removing kibitz hook entries from $SETTINGS_FILE"
-    unmerge_settings
+    unmerge_settings "$SETTINGS_FILE"
+    info "Removing kibitz hook entries from $CODEX_SETTINGS_FILE"
+    unmerge_settings "$CODEX_SETTINGS_FILE"
   else
-    warn "python3 not found; remove kibitz entries from $SETTINGS_FILE manually"
+    warn "python3 not found; remove kibitz entries from $SETTINGS_FILE and $CODEX_SETTINGS_FILE manually"
   fi
+
+  # Intentionally leave `[features] codex_hooks = true` in place:
+  # the flag is harmless when no hooks are registered, and flipping
+  # it off could disable other hooks the user added independently.
 
   local removed=() script
   local files=(
@@ -584,6 +730,13 @@ cmd_uninstall() {
     fi
   done
 
+  # Blow away the codex-relay cache — stale .msg files are only meaningful
+  # with the Stop hook that wrote them, which we just removed.
+  if [[ -d "$KIBITZ_CACHE_DIR" ]]; then
+    rm -rf "$KIBITZ_CACHE_DIR"
+    removed+=("$KIBITZ_CACHE_DIR/")
+  fi
+
   if (( ${#removed[@]} > 0 )); then
     info "Removed: ${removed[*]}"
   else
@@ -597,7 +750,7 @@ usage() {
   cat <<EOF
 kibitz — run a sidecar reviewer agent (codex or claude) in a tmux split pane.
 
-Usage: $(basename "$0") {install|uninstall|start [agent]|stop|status|restart [agent]|send <text>}
+Usage: $(basename "$0") {install|uninstall|start [agent]|stop|status|restart [agent]|send <text>|relay}
 
 Commands:
   install          Install tmux-bridge, kibitz, and the hook scripts
@@ -623,6 +776,10 @@ Commands:
                    with a minimal '[kibitz from:<agent>]' header. Routes via the
                    pane-local @kibitz_host_pane option set at start time, so
                    concurrent reviewer pairs in different windows don't cross.
+  relay            Codex reviewer only. Forward codex's own last assistant reply
+                   verbatim to the host pane, using the payload the codex Stop
+                   hook stashed in \$XDG_CACHE_HOME/kibitz/codex-<thread>.msg.
+                   No dedupe: running 'relay' twice sends twice.
 
 Environment:
   NO_COLOR    If set, suppress ANSI color output.
@@ -639,6 +796,7 @@ case "$1" in
   status)    shift; cmd_status ;;
   restart)   shift; cmd_restart "${1:-}" ;;
   send)      shift; cmd_send "$@" ;;
+  relay)     shift; cmd_relay ;;
   -h|--help|help) usage ;;
   *) echo "unknown command: $1" >&2; usage; exit 2 ;;
 esac

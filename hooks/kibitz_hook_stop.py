@@ -9,6 +9,10 @@ Directives on the user's message:
   - "/mute" (trailing) — this exchange is not forwarded.
   - "/dup"  (trailing) — the user text was already forwarded at submit time by
     kibitz_hook_user_prompt_submit.py; the reply is intentionally not sent.
+
+Replies to reviewer-originated messages (those carrying a '[kibitz from:...]'
+header from `kibitz send`) are not forwarded back, to prevent host/reviewer
+ping-pong loops.
 """
 import hashlib
 import json
@@ -21,6 +25,7 @@ from kibitz_hook_common import (
     current_pane_label,
     extract_text,
     forward,
+    is_reviewer_originated,
     is_skippable_user_text,
     log,
     parse_directive,
@@ -85,6 +90,12 @@ def main():
 
     user_text_raw = latest_user_prompt(tpath)
     if not user_text_raw:
+        return 0
+
+    # Don't relay replies to reviewer-originated messages back to the reviewer
+    # — otherwise "[kibitz from:codex] hi" -> claude replies "hi" -> forwarded
+    # to codex -> codex replies -> loop.
+    if is_reviewer_originated(user_text_raw):
         return 0
 
     user_text, directive = parse_directive(user_text_raw)
