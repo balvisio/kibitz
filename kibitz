@@ -5,7 +5,16 @@ set -euo pipefail
 
 KNOWN_LABELS=("codex" "claude-reviewer")
 INSTALL_DIR="$HOME/.local/bin"
-HOOK_SCRIPT_NAME="kibitz_hook_stop.py"
+# Hook scripts installed into $INSTALL_DIR. The first two are wired as commands
+# in settings.json; kibitz_hook_common.py is a sibling module imported by both.
+# The same array is the source of truth for settings merge/unmerge ownership —
+# we match by exact basename so an unrelated hook that happens to share the
+# kibitz_hook_ prefix (e.g., /opt/acme/kibitz_hook_custom.py) is never touched.
+HOOK_SCRIPTS=(
+  "kibitz_hook_stop.py"
+  "kibitz_hook_user_prompt_submit.py"
+  "kibitz_hook_common.py"
+)
 HOOK_JSON_NAME="kibitz_hook.json"
 SETTINGS_FILE="$HOME/.claude/settings.json"
 HOOK_LOG_PATH="$HOME/.claude/kibitz-hook.log"
@@ -198,17 +207,20 @@ bootstrap_into() {
   fi
 }
 
-# Merge a Stop-hook fragment into ~/.claude/settings.json without clobbering
-# other hooks. Idempotent: skips the append if our command is already present.
+# Merge the kibitz hook fragment into ~/.claude/settings.json without
+# clobbering other hooks. Idempotent per event: if any kibitz-owned command is
+# already present under a given event, that event is left alone — so adding or
+# removing hook scripts over time doesn't duplicate or strand entries.
 merge_settings() {
   local fragment="$1"
-  python3 - "$fragment" "$SETTINGS_FILE" "$HOOK_SCRIPT_NAME" <<'PY'
+  python3 - "$fragment" "$SETTINGS_FILE" "${HOOK_SCRIPTS[@]}" <<'PY'
 import json, sys
+from os.path import basename
 from pathlib import Path
 
 fragment_path = Path(sys.argv[1])
 settings_path = Path(sys.argv[2])
-marker = sys.argv[3]
+known_basenames = frozenset(sys.argv[3:])
 
 with fragment_path.open() as f:
     fragment = json.load(f)
@@ -230,11 +242,18 @@ if not isinstance(hooks, dict):
     sys.stderr.write(f"error: 'hooks' in {settings_path} is not an object\n")
     sys.exit(1)
 
+# Match on exact basename against the known script names so any path shape
+# (literal $HOME, expanded, relative) routes to the same decision — and so an
+# unrelated third-party hook that happens to share our filename prefix isn't
+# treated as kibitz-owned.
+def is_kibitz_cmd(cmd):
+    return basename(cmd or "") in known_basenames
+
 def has_our_cmd(group):
     if not isinstance(group, dict):
         return False
     for h in group.get("hooks", []) or []:
-        if isinstance(h, dict) and marker in (h.get("command") or ""):
+        if isinstance(h, dict) and is_kibitz_cmd(h.get("command")):
             return True
     return False
 
@@ -257,12 +276,13 @@ PY
 
 # Strip kibitz-installed hook entries from ~/.claude/settings.json.
 unmerge_settings() {
-  python3 - "$SETTINGS_FILE" "$HOOK_SCRIPT_NAME" <<'PY'
+  python3 - "$SETTINGS_FILE" "${HOOK_SCRIPTS[@]}" <<'PY'
 import json, sys
+from os.path import basename
 from pathlib import Path
 
 settings_path = Path(sys.argv[1])
-marker = sys.argv[2]
+known_basenames = frozenset(sys.argv[2:])
 
 if not settings_path.exists():
     sys.exit(0)
@@ -278,6 +298,9 @@ if not isinstance(settings, dict):
 hooks = settings.get("hooks")
 if not isinstance(hooks, dict):
     sys.exit(0)
+
+def is_kibitz_cmd(cmd):
+    return basename(cmd or "") in known_basenames
 
 changed = False
 for event in list(hooks.keys()):
@@ -295,7 +318,7 @@ for event in list(hooks.keys()):
             continue
         kept_inner = []
         for h in inner:
-            if isinstance(h, dict) and marker in (h.get("command") or ""):
+            if isinstance(h, dict) and is_kibitz_cmd(h.get("command")):
                 changed = True
                 continue
             kept_inner.append(h)
@@ -328,7 +351,7 @@ cmd_install() {
   command -v python3 >/dev/null 2>&1 \
     || die "python3 is required on PATH (needed by the Stop hook and settings merge)"
 
-  local src_dir bridge_src hook_src hook_json_src launcher_src claude_agent_src codex_role_src
+  local src_dir bridge_src hook_json_src launcher_src claude_agent_src codex_role_src
   if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
     src_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
   else
@@ -339,18 +362,22 @@ cmd_install() {
     bootstrap_into "$src_dir"
   fi
   bridge_src="$src_dir/scripts/tmux-bridge"
-  hook_src="$src_dir/hooks/$HOOK_SCRIPT_NAME"
   hook_json_src="$src_dir/hooks/$HOOK_JSON_NAME"
   launcher_src="$src_dir/scripts/$LAUNCHER_NAME"
   claude_agent_src="$src_dir/agents/$CLAUDE_AGENT_FILE"
   codex_role_src="$src_dir/instructions/$CODEX_ROLE_FILE"
 
   [[ -f "$bridge_src" ]]       || die "tmux-bridge not found: $bridge_src"
-  [[ -f "$hook_src" ]]         || die "hook script not found: $hook_src"
   [[ -f "$hook_json_src" ]]    || die "hook JSON fragment not found: $hook_json_src"
   [[ -f "$launcher_src" ]]     || die "reviewer launcher not found: $launcher_src"
   [[ -f "$claude_agent_src" ]] || die "claude reviewer agent not found: $claude_agent_src"
   [[ -f "$codex_role_src" ]]   || die "codex reviewer instructions not found: $codex_role_src"
+
+  local script hook_src
+  for script in "${HOOK_SCRIPTS[@]}"; do
+    hook_src="$src_dir/hooks/$script"
+    [[ -f "$hook_src" ]] || die "hook script not found: $hook_src"
+  done
 
   mkdir -p "$INSTALL_DIR"
 
@@ -360,8 +387,10 @@ cmd_install() {
   info "Installing kibitz to $INSTALL_DIR/kibitz"
   copy_script "${BASH_SOURCE[0]}" "$INSTALL_DIR/kibitz"
 
-  info "Installing hook script to $INSTALL_DIR/$HOOK_SCRIPT_NAME"
-  copy_script "$hook_src" "$INSTALL_DIR/$HOOK_SCRIPT_NAME"
+  for script in "${HOOK_SCRIPTS[@]}"; do
+    info "Installing hook script to $INSTALL_DIR/$script"
+    copy_script "$src_dir/hooks/$script" "$INSTALL_DIR/$script"
+  done
 
   info "Installing reviewer launcher to $INSTALL_DIR/$LAUNCHER_NAME"
   copy_script "$launcher_src" "$INSTALL_DIR/$LAUNCHER_NAME"
@@ -374,7 +403,7 @@ cmd_install() {
   mkdir -p "$CLAUDE_AGENTS_DIR"
   cp "$claude_agent_src" "$CLAUDE_AGENTS_DIR/$CLAUDE_AGENT_FILE"
 
-  info "Merging Stop hook into $SETTINGS_FILE"
+  info "Merging kibitz hook entries into $SETTINGS_FILE"
   merge_settings "$hook_json_src" || die "settings merge failed"
 
   ensure_path "$INSTALL_DIR"
@@ -535,16 +564,20 @@ cmd_uninstall() {
     warn "python3 not found; remove kibitz entries from $SETTINGS_FILE manually"
   fi
 
-  local removed=()
-  for f in \
-    "$INSTALL_DIR/$HOOK_SCRIPT_NAME" \
-    "$INSTALL_DIR/kibitz" \
-    "$INSTALL_DIR/tmux-bridge" \
-    "$INSTALL_DIR/$LAUNCHER_NAME" \
-    "$CODEX_ROLE_DIR/$CODEX_ROLE_FILE" \
-    "$CLAUDE_AGENTS_DIR/$CLAUDE_AGENT_FILE" \
+  local removed=() script
+  local files=(
+    "$INSTALL_DIR/kibitz"
+    "$INSTALL_DIR/tmux-bridge"
+    "$INSTALL_DIR/$LAUNCHER_NAME"
+    "$CODEX_ROLE_DIR/$CODEX_ROLE_FILE"
+    "$CLAUDE_AGENTS_DIR/$CLAUDE_AGENT_FILE"
     "$HOOK_LOG_PATH"
-  do
+  )
+  for script in "${HOOK_SCRIPTS[@]}"; do
+    files+=("$INSTALL_DIR/$script")
+  done
+  local f
+  for f in "${files[@]}"; do
     if [[ -e "$f" ]]; then
       rm -f "$f"
       removed+=("$f")
@@ -567,13 +600,13 @@ kibitz — run a sidecar reviewer agent (codex or claude) in a tmux split pane.
 Usage: $(basename "$0") {install|uninstall|start [agent]|stop|status|restart [agent]|send <text>}
 
 Commands:
-  install          Install tmux-bridge, kibitz, and the Stop hook script
-                   into $INSTALL_DIR, merge the Stop hook entry into
+  install          Install tmux-bridge, kibitz, and the hook scripts
+                   into $INSTALL_DIR, merge kibitz hook entries into
                    $SETTINGS_FILE, and ensure $INSTALL_DIR is on PATH.
                    Requires python3. Warns if codex/claude binaries are missing.
                    Run from a checkout of this repo.
-  uninstall        Remove the Stop hook entry from $SETTINGS_FILE and delete
-                   all installed scripts (kibitz, tmux-bridge, hook script).
+  uninstall        Remove kibitz hook entries from $SETTINGS_FILE and delete
+                   all installed scripts (kibitz, tmux-bridge, hook scripts).
   start [agent]    Split the current tmux window and launch a reviewer agent.
                    If 'agent' is omitted, auto-detects the host agent and
                    spawns the other one:

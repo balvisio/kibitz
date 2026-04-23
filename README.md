@@ -19,6 +19,23 @@ Named after the Yiddish *kibbitzer* — the spectator who can't resist offering 
 - **Slash commands are not forwarded.** If the most recent user turn starts with `/` (like `/clear`), the Stop hook skips forwarding that exchange.
 - **Recursion-safe.** If the hook runs inside a pane already labeled `codex` or `claude-reviewer`, it no-ops — so nesting sessions doesn't create a forwarding loop.
 
+### Directives
+
+Append one of these tokens to the end of your message to change what the reviewer sees for that turn. Tokens are case-sensitive and must be preceded by whitespace (or stand alone as the whole message). Non-trailing occurrences are ignored.
+
+| You type                  | Submit-time                  | After Claude's reply           |
+|---------------------------|------------------------------|--------------------------------|
+| `hello`                   | —                            | forward USER + CLAUDE          |
+| `hello /mute`             | —                            | nothing                        |
+| `hello /dup`              | forward USER (stripped)      | nothing                        |
+| `/mute` (bare)            | —                            | nothing                        |
+| `/dup` (bare)             | nothing                      | nothing                        |
+
+- `/mute` — skip forwarding this exchange entirely. Useful for side chatter you don't want the reviewer to spend context on.
+- `/dup` — send your message to the reviewer immediately (via a `UserPromptSubmit` hook), and *don't* forward Claude's reply. Useful when you want the reviewer to work on the same problem in parallel rather than critique the answer. If the submit-time forward fails (transport glitch, reviewer pane gone), the turn isn't silently retried at Stop time — errors land in `~/.claude/kibitz-hook.log` and you can resend with `/dup` manually.
+
+Claude itself still sees the `/mute` or `/dup` suffix in your prompt — Claude Code hooks can observe a prompt but can't rewrite it in place. Treat the trailing directive as benign noise; the model ignores it.
+
 ## Requirements
 
 - Linux (host detection reads `/proc`; macOS fallback is explicit-arg-only)
@@ -52,8 +69,8 @@ From a checkout of this repo:
 What install does:
 
 1. Verifies `python3` is on PATH.
-2. Copies `scripts/tmux-bridge`, `kibitz`, and `hooks/kibitz_hook_stop.py` into `~/.local/bin/`.
-3. Merges the Stop hook entry from `hooks/kibitz_hook.json` into `~/.claude/settings.json` (idempotent — won't duplicate on reinstall, preserves any other hooks you have).
+2. Copies `scripts/tmux-bridge`, `kibitz`, and the `hooks/kibitz_hook_*.py` scripts into `~/.local/bin/`.
+3. Merges the Stop and UserPromptSubmit hook entries from `hooks/kibitz_hook.json` into `~/.claude/settings.json` (idempotent — won't duplicate on reinstall, preserves any other hooks you have).
 4. Adds `~/.local/bin/` to `PATH` in your shell rc (`.zshrc` / `.bashrc` / `.profile`) if it isn't already.
 5. Warns if `codex` or `claude` binaries are missing (non-fatal).
 
@@ -99,8 +116,10 @@ tmux-bridge keys codex Enter            # press Enter in the reviewer pane
 kibitz/
 ├── kibitz                      # the management script (bash)
 ├── hooks/
-│   ├── kibitz_hook_stop.py     # the Stop hook — parses transcript, forwards to reviewer
-│   └── kibitz_hook.json        # the settings.json fragment `install` merges in
+│   ├── kibitz_hook_stop.py                 # Stop hook — forwards user/assistant exchange
+│   ├── kibitz_hook_user_prompt_submit.py   # UserPromptSubmit hook — implements `/dup`
+│   ├── kibitz_hook_common.py               # shared helpers imported by both hooks
+│   └── kibitz_hook.json                    # settings.json fragment `install` merges in
 ├── scripts/
 │   └── tmux-bridge             # vendored from ShawnPana/smux
 ├── LICENSE
@@ -113,10 +132,12 @@ After install, the runtime copies land in `~/.local/bin/`:
 ~/.local/bin/
 ├── kibitz
 ├── kibitz_hook_stop.py
+├── kibitz_hook_user_prompt_submit.py
+├── kibitz_hook_common.py
 └── tmux-bridge
 ```
 
-And a hook entry is added to `~/.claude/settings.json`:
+And hook entries are added to `~/.claude/settings.json`:
 
 ```json
 {
@@ -125,6 +146,13 @@ And a hook entry is added to `~/.claude/settings.json`:
       {
         "hooks": [
           { "type": "command", "command": "$HOME/.local/bin/kibitz_hook_stop.py" }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "$HOME/.local/bin/kibitz_hook_user_prompt_submit.py" }
         ]
       }
     ]
