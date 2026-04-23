@@ -136,8 +136,8 @@ ${RED}========================================================================
 ========================================================================${RESET}
 ${RED}The reviewer can still run, but the smux communication layer is
 missing. Without it:
-  - Reviewer messages to the host won't carry the '[tmux-bridge from:... ]'
-    header, so the host agent can't distinguish them from real user input.
+  - 'kibitz send' has no transport and will fail, so the reviewer
+    has no way to relay messages back to the host pane.
   - The Stop hook that forwards each exchange has no reliable
     cross-pane transport.
 
@@ -446,20 +446,24 @@ cmd_start() {
     launch_cmd="$binary"
   fi
 
+  local host_pane="${TMUX_PANE:-}"
+  [[ -n "$host_pane" ]] || die "\$TMUX_PANE is unset (need it to record the host pane)"
+
   local new_pane
   new_pane=$(tmux split-window -h -P -F '#{pane_id}' "$launch_cmd")
   tmux set-option -p -t "$new_pane" @name "$label" >/dev/null
+  tmux set-option -p -t "$new_pane" @kibitz_host_pane "$host_pane" >/dev/null
 
   cat <<BANNER
-kibitz: started '$agent' on pane $new_pane (labeled '$label').
+kibitz: started '$agent' (labeled '$label').
 
 A kibitz reviewer is now watching this session from an adjacent tmux pane. Your user/assistant exchanges are forwarded to it automatically via a Stop hook — nothing to do on your end. By default the reviewer keeps its opinions in its own pane.
 
-Occasionally the reviewer may relay a message back into this pane. When that happens it arrives with an smux header:
+Occasionally the reviewer may relay a message back into this pane (via 'kibitz send'). When that happens it arrives with a kibitz header:
 
-    [tmux-bridge from:$label pane:$new_pane at:<session>:<win>.<pane> — load the smux skill to reply]
+    [kibitz from:$agent] <message>
 
-Treat anything with that header as input from the reviewer (via kibitz), not from the user. Anything without it is real user input.
+Treat anything with that header as input from the reviewer, not from the user. Anything without it is real user input.
 BANNER
 
   warn_if_no_bridge
@@ -482,6 +486,45 @@ cmd_stop() {
 cmd_restart() {
   cmd_stop || true
   cmd_start "${1:-}"
+}
+
+# Relay a message from the reviewer pane back to its host pane. Reads the
+# host pane ID from the pane-local @kibitz_host_pane option that cmd_start
+# stamped on the reviewer pane — so two windows each with their own
+# claude+codex pair route independently.
+cmd_send() {
+  in_tmux || die "not inside a tmux session (\$TMUX is unset)"
+
+  local text="$*"
+  [[ -n "$text" ]] || die "usage: $(basename "$0") send <text>"
+
+  local my_pane="${TMUX_PANE:-}"
+  [[ -n "$my_pane" ]] || die "\$TMUX_PANE is unset"
+
+  local host_pane my_label
+  host_pane=$(tmux display-message -t "$my_pane" -p '#{@kibitz_host_pane}' 2>/dev/null || true)
+  my_label=$(tmux display-message -t "$my_pane" -p '#{@name}' 2>/dev/null || true)
+
+  [[ -n "$host_pane" ]] \
+    || die "not running inside a kibitz reviewer pane (no @kibitz_host_pane on $my_pane)"
+
+  tmux display-message -t "$host_pane" -p '#{pane_id}' >/dev/null 2>&1 \
+    || die "host pane $host_pane no longer exists — run '$(basename "$0") restart' from the host"
+
+  has_bridge || die "tmux-bridge not found in PATH (run: $(basename "$0") install)"
+
+  local agent
+  case "$my_label" in
+    codex)           agent="codex" ;;
+    claude-reviewer) agent="claude" ;;
+    *)               agent="${my_label:-reviewer}" ;;
+  esac
+
+  # Read satisfies tmux-bridge's read-guard before message/keys.
+  tmux-bridge read "$host_pane" 1 >/dev/null
+  tmux-bridge message --header "[kibitz from:$agent]" "$host_pane" "$text"
+  tmux-bridge read "$host_pane" 1 >/dev/null
+  tmux-bridge keys "$host_pane" Enter
 }
 
 cmd_uninstall() {
@@ -521,7 +564,7 @@ usage() {
   cat <<EOF
 kibitz — run a sidecar reviewer agent (codex or claude) in a tmux split pane.
 
-Usage: $(basename "$0") {install|uninstall|start [agent]|stop|status|restart [agent]}
+Usage: $(basename "$0") {install|uninstall|start [agent]|stop|status|restart [agent]|send <text>}
 
 Commands:
   install          Install tmux-bridge, kibitz, and the Stop hook script
@@ -543,6 +586,10 @@ Commands:
   stop             Kill the current reviewer pane (whichever agent).
   status           Print whether a reviewer is running and where.
   restart [agent]  Stop then start (optionally switching agents).
+  send <text>      Relay a message from the reviewer pane back to its host pane
+                   with a minimal '[kibitz from:<agent>]' header. Routes via the
+                   pane-local @kibitz_host_pane option set at start time, so
+                   concurrent reviewer pairs in different windows don't cross.
 
 Environment:
   NO_COLOR    If set, suppress ANSI color output.
@@ -558,6 +605,7 @@ case "$1" in
   stop)      shift; cmd_stop ;;
   status)    shift; cmd_status ;;
   restart)   shift; cmd_restart "${1:-}" ;;
+  send)      shift; cmd_send "$@" ;;
   -h|--help|help) usage ;;
   *) echo "unknown command: $1" >&2; usage; exit 2 ;;
 esac

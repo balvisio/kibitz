@@ -141,6 +141,7 @@ Commands:
   list                      Show all panes (target, pid, command, size, label)
   type <target> <text>      Type text without pressing Enter
   message <target> <text>   Type text with auto-prepended sender info and reply target
+                            (use --header <string> before <target> to override the default header)
   read <target> [lines]     Read last N lines from pane (default: 50)
   keys <target> <key>...    Send special keys (Enter, Escape, C-c, etc.)
   name <target> <label>     Label a pane (visible in tmux border)
@@ -251,26 +252,48 @@ cmd_type() {
 }
 
 cmd_message() {
-  require_args 2 $# "message"
   require_tmux
+
+  # Parse optional --header <string> before positional args.
+  local custom_header="" has_custom_header=0
+  local -a positional=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --header)
+        [[ $# -ge 2 ]] || die "'message --header' requires a value"
+        custom_header="$2"
+        has_custom_header=1
+        shift 2
+        ;;
+      --) shift; while (( $# > 0 )); do positional+=("$1"); shift; done ;;
+      *)  positional+=("$1"); shift ;;
+    esac
+  done
+
+  require_args 2 ${#positional[@]} "message"
   local target
-  target=$(resolve_target "$1")
+  target=$(resolve_target "${positional[0]}")
   validate_target "$target"
   require_read "$target"
 
-  # Detect sender identity and location
-  local sender_pane="${TMUX_PANE:-}"
-  if [[ -z "$sender_pane" ]]; then
-    die "not running inside a tmux pane (\$TMUX_PANE is unset)"
+  local header
+  if (( has_custom_header )); then
+    header="$custom_header"
+  else
+    # Default: auto-detect sender identity and location.
+    local sender_pane="${TMUX_PANE:-}"
+    if [[ -z "$sender_pane" ]]; then
+      die "not running inside a tmux pane (\$TMUX_PANE is unset)"
+    fi
+    local sender_label
+    sender_label=$(tmx display-message -t "$sender_pane" -p '#{@name}' 2>/dev/null || true)
+    local from="${sender_label:-$sender_pane}"
+    local session_win
+    session_win=$(tmx display-message -t "$sender_pane" -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || true)
+    header="[tmux-bridge from:${from} pane:${sender_pane} at:${session_win} — load the smux skill to reply]"
   fi
-  local sender_label
-  sender_label=$(tmx display-message -t "$sender_pane" -p '#{@name}' 2>/dev/null || true)
-  local from="${sender_label:-$sender_pane}"
-  local session_win
-  session_win=$(tmx display-message -t "$sender_pane" -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || true)
 
-  local header="[tmux-bridge from:${from} pane:${sender_pane} at:${session_win} — load the smux skill to reply]"
-  bracketed_paste "$target" "${header} $2"
+  bracketed_paste "$target" "${header} ${positional[1]}"
   clear_read "$target"
 }
 

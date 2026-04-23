@@ -210,7 +210,7 @@ def main() -> int:
         return 0
 
     message = (
-        "[kibitz:exchange from:claude-host]\n\n"
+        "[kibitz from:claude]\n\n"
         f"USER:\n{user_text}\n\n"
         f"CLAUDE:\n{assistant_text}"
     )

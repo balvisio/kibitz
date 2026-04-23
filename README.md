@@ -8,14 +8,14 @@ Named after the Yiddish *kibbitzer* — the spectator who can't resist offering 
 
 - `kibitz start` splits the current tmux window (vertical divider), launches the reviewer agent in the new pane, labels the pane via smux (`codex` or `claude-reviewer`).
 - A Claude Code `Stop` hook extracts the latest user + assistant turn from the session transcript and forwards them to the reviewer pane using `tmux-bridge`.
-- The reviewer sends messages back through `tmux-bridge`, which prepends an `[tmux-bridge from:... ]` header so the host agent can tell them apart from real user input.
+- The reviewer sends messages back via `kibitz send "<text>"`, which prepends a minimal `[kibitz from:<agent>]` header (e.g. `[kibitz from:codex]`) so the host agent can tell them apart from real user input.
 - `kibitz stop` / `kibitz restart` / `kibitz status` manage the pane lifecycle.
 - `kibitz uninstall` tears everything down cleanly.
 
 ### Behavior conventions
 
 - **Reviewer is read-only by default.** The sidecar is meant to watch and comment, not drive. It should only message the host back when the user explicitly asks it to relay something.
-- **Host can tell who typed what.** Anything that arrives at the host with the smux `[tmux-bridge from:... ]` header came from the reviewer. Anything without it is real user input.
+- **Host can tell who typed what.** Anything that arrives at the host with a `[kibitz from:<agent>]` header came from the reviewer (emitted by `kibitz send`). Anything without it is real user input.
 - **Slash commands are not forwarded.** If the most recent user turn starts with `/` (like `/clear`), the Stop hook skips forwarding that exchange.
 - **Recursion-safe.** If the hook runs inside a pane already labeled `codex` or `claude-reviewer`, it no-ops — so nesting sessions doesn't create a forwarding loop.
 
