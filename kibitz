@@ -126,13 +126,14 @@ pick_reviewer_agent() {
 }
 
 # ---------- Pane lookup ----------
-# Scoped to the *current tmux window*: kibitz is a per-window sidecar (it splits
-# this window), so another window's reviewer must not block `start` here or be
-# killed by `stop` here. Outside tmux the list-panes call errors; we swallow it
-# so status/stop degrade to "not running" rather than blowing up.
+# Scoped to the host pane's tmux window via `-t $TMUX_PANE`: kibitz is a
+# per-window sidecar (it splits this window), so another window's reviewer
+# must not block `start` here or be killed by `stop` here. Outside tmux the
+# list-panes call errors; we swallow it so status/stop degrade to "not
+# running" rather than blowing up.
 find_reviewer_pane() {
   local panes
-  panes=$(tmux list-panes -F '#{pane_id} #{@name}' 2>/dev/null || true)
+  panes=$(tmux list-panes -t "${TMUX_PANE:-}" -F '#{pane_id} #{@name}' 2>/dev/null || true)
   [[ -z "$panes" ]] && return 0
   local labels_joined=" ${KNOWN_LABELS[*]} "
   echo "$panes" | awk -v labels="$labels_joined" '

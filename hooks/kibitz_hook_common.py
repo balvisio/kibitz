@@ -118,7 +118,7 @@ def current_pane_label():
 
 
 def resolve_reviewer():
-    """Find a reviewer pane in the *current tmux window* only.
+    """Find a reviewer pane in the host pane's tmux window only.
 
     Returning the pane_id (not just the label) lets us route via tmux-bridge
     unambiguously — `tmux-bridge resolve <label>` is server-wide, so with
@@ -127,9 +127,12 @@ def resolve_reviewer():
 
     Returns (pane_id, label) or None.
     """
+    host_pane = os.environ.get("TMUX_PANE", "")
+    if not host_pane:
+        return None
     try:
         r = subprocess.run(
-            ["tmux", "list-panes", "-F", "#{pane_id} #{@name}"],
+            ["tmux", "list-panes", "-t", host_pane, "-F", "#{pane_id} #{@name}"],
             capture_output=True, text=True, check=True, timeout=5,
         )
     except Exception:
