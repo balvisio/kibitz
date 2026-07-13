@@ -565,7 +565,7 @@ cmd_start() {
   [[ -n "$host_pane" ]] || die "\$TMUX_PANE is unset (need it to record the host pane)"
 
   local new_pane
-  new_pane=$(tmux split-window -h -P -F '#{pane_id}' "$launch_cmd")
+  new_pane=$(tmux split-window -h -P -F '#{pane_id}' -e "CODEX_HOME=${CODEX_HOME:-$HOME/.codex}" "$launch_cmd")
   tmux set-option -p -t "$new_pane" @name "$label" >/dev/null
   tmux set-option -p -t "$new_pane" @kibitz_host_pane "$host_pane" >/dev/null
 
