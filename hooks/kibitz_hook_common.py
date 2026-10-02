@@ -18,16 +18,23 @@ LAST_FORWARD_PATH = Path.home() / ".claude" / "kibitz-last.txt"
 # resembles a directive.
 KIBITZ_DIRECTIVES = ("/mute", "/tee")
 
-# User-entry content that isn't a real prompt (Claude Code local-command
-# artifacts, tool errors, slash commands). Any user entry whose stripped text
-# starts with one of these — or a leading '/' — is skipped when picking the
-# "latest user prompt" to forward.
-_SKIP_USER_PREFIXES = (
+# User-entry content Claude Code records for a `! shell` command. A reply it
+# triggers is never forwarded automatically — `kibitz relay` sends it by hand.
+_SHELL_PREFIXES = (
     "<bash-input>",
     "<bash-stdout>",
     "<bash-stderr>",
+)
+
+# User-entry content that isn't a real prompt: the shell records above, the
+# three entries written for a slash command (/model, /effort and /fast run
+# while Claude is still working, so these can land mid-turn), tool errors.
+# Any user entry whose stripped text starts with one of these — or a leading
+# '/' — is never used as the USER text of a forwarded exchange.
+_SKIP_USER_PREFIXES = _SHELL_PREFIXES + (
     "<local-command-caveat>",
     "<command-name>",
+    "<local-command-stdout>",
     "<tool_use_error>",
 )
 
@@ -72,6 +79,15 @@ def is_skippable_user_text(text):
             return False
         return True
     return s.startswith(_SKIP_USER_PREFIXES)
+
+
+def is_command_text(text):
+    """Return True for a user entry that is a `! shell` command record or a
+    typed slash command (bare /mute and /tee are directives, not commands)."""
+    s = text.lstrip()
+    if s.startswith("/"):
+        return s.rstrip() not in KIBITZ_DIRECTIVES
+    return s.startswith(_SHELL_PREFIXES)
 
 
 def is_reviewer_originated(text):

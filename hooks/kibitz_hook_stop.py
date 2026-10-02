@@ -14,10 +14,17 @@ Directives on the user's message:
 Replies to reviewer-originated messages (those carrying a '[kibitz from:...]'
 header from `kibitz send`) are not forwarded back, to prevent host/reviewer
 ping-pong loops.
+
+Claude Code also fires Stop when a turn merely pauses for background work
+(Monitor, background Bash, async Agent, Workflow) and later resumes from a
+<task-notification> user entry. Those interim replies are not forwarded: the
+exchange goes out once the work launched for the user's prompt has finished,
+attributed to that prompt rather than to the notification.
 """
 import hashlib
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -27,6 +34,7 @@ from kibitz_hook_common import (
     current_pane_label,
     extract_text,
     forward,
+    is_command_text,
     is_reviewer_originated,
     is_skippable_user_text,
     log,
@@ -35,6 +43,12 @@ from kibitz_hook_common import (
 )
 
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "kibitz"
+
+# toolUseResult keys under which Claude Code records the id of a task it put
+# in the background (Monitor and Workflow, Bash run_in_background, Agent). The
+# same id shows up in background_tasks[].id of the Stop payload and in the
+# <task-id> of the notification that later resumes the session.
+_TASK_ID_KEYS = ("taskId", "backgroundTaskId", "agentId")
 
 
 def stash_host_turn(pane_id, payload):
@@ -69,12 +83,7 @@ def stash_host_turn(pane_id, payload):
         log(f"stash: write failed for {msg_path}: {e}")
 
 
-def latest_user_prompt(transcript_path):
-    """Scan the transcript backward for the most recent user entry that looks
-    like a real prompt (not a tool_result, bash-input/output, command caveat,
-    or slash command). User entries are flushed long before the Stop hook
-    fires, so a plain backward scan is safe — unlike the final assistant text
-    block, which is often still buffered at hook time."""
+def load_entries(transcript_path):
     entries = []
     with transcript_path.open() as f:
         for line in f:
@@ -82,24 +91,72 @@ def latest_user_prompt(transcript_path):
             if not line:
                 continue
             try:
-                entries.append(json.loads(line))
+                entry = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if isinstance(entry, dict):
+                entries.append(entry)
+    return entries
 
-    for entry in reversed(entries):
-        if not isinstance(entry, dict):
-            continue
-        if entry.get("type") != "user":
-            continue
-        msg = entry.get("message")
-        if not isinstance(msg, dict):
-            continue
-        text = extract_text(msg.get("content"))
-        if not text or is_skippable_user_text(text):
-            continue
-        return text
 
-    return None
+def user_text(entry):
+    """Text of a user entry; "" for tool results and non-user entries."""
+    if entry.get("type") != "user":
+        return ""
+    msg = entry.get("message")
+    if not isinstance(msg, dict):
+        return ""
+    return extract_text(msg.get("content"))
+
+
+def is_task_notification(text):
+    return text.lstrip().startswith("<task-notification>")
+
+
+def launched_task_ids(entry):
+    result = entry.get("toolUseResult")
+    if not isinstance(result, dict):
+        return set()
+    return {result[key] for key in _TASK_ID_KEYS if isinstance(result.get(key), str)}
+
+
+def current_exchange(transcript_path):
+    """Return (prompt_text, tasks): the human prompt that owns the turn being
+    stopped and the ids of every background task launched on its behalf.
+
+    A turn is started by a typed prompt, a <task-notification> or a `! shell`
+    command. A notification-started turn belongs to whichever prompt owns the
+    task that produced it, so ownership follows notification ancestry through
+    any chain of launches, and tasks launched during a turn belong to that
+    turn's prompt. Turns started by a shell command, or by a notification
+    that cannot be traced to a launch in this transcript, own nothing and are
+    never forwarded. Slash-command records never start a reply and may land
+    inside an ongoing turn, so they leave ownership untouched. User entries
+    are flushed long before the Stop hook fires, so
+    reading the transcript here is safe — unlike the final assistant text
+    block, which is often still buffered at hook time."""
+    entries = load_entries(transcript_path)
+    owner = None
+    task_owner = {}
+    tasks = {}
+    for i, entry in enumerate(entries):
+        text = user_text(entry)
+        if not text:
+            if owner is not None:
+                for task_id in launched_task_ids(entry):
+                    task_owner[task_id] = owner
+                    tasks.setdefault(owner, set()).add(task_id)
+        elif is_task_notification(text):
+            ids = re.findall(r"<task-id>([^<]+)</task-id>", text)
+            known = [task_owner[task_id] for task_id in ids if task_id in task_owner]
+            owner = known[0] if known else None
+        elif is_command_text(text):
+            owner = None
+        elif not is_skippable_user_text(text):
+            owner = i
+    if owner is None:
+        return None, set()
+    return user_text(entries[owner]), tasks.get(owner, set())
 
 
 def main():
@@ -135,7 +192,7 @@ def main():
         return 0
     pane_id, _reviewer_label = reviewer
 
-    user_text_raw = latest_user_prompt(tpath)
+    user_text_raw, launched = current_exchange(tpath)
     if not user_text_raw:
         return 0
 
@@ -151,6 +208,16 @@ def main():
     # reply for it. Option B falls out of this too: a bare /mute or /tee leaves
     # user_text empty with a directive set, and we return here.
     if directive:
+        return 0
+
+    # Stop also fires when the turn only pauses for background work that will
+    # wake the session again; background_tasks lists what is still in flight.
+    # If any of it belongs to this prompt, the reply is interim status.
+    pending = set()
+    for task in payload.get("background_tasks") or []:
+        if isinstance(task, dict) and isinstance(task.get("id"), str):
+            pending.add(task["id"])
+    if launched & pending:
         return 0
 
     raw = payload.get("last_assistant_message") if isinstance(payload, dict) else None
