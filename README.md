@@ -10,7 +10,7 @@ Named after the Yiddish *kibbitzer* — the spectator who can't resist offering 
 - A Claude Code `Stop` hook extracts the latest user + assistant turn from the session transcript and forwards them to the reviewer pane using `tmux-bridge`.
 - The reviewer sends messages back two ways, both prepend a `[kibitz from:<agent>]` header so the host can tell them apart from real user input:
   - `kibitz send "<text>"` — send custom text.
-  - `kibitz relay` — forward the agent's own last assistant reply verbatim to its counterpart pane. From a codex reviewer pane, forwards codex's reply to the claude host; from a claude host pane, forwards claude's reply to the codex reviewer. Each agent's `Stop` hook stashes `last_assistant_message` under `$XDG_CACHE_HOME/kibitz/` — `codex-<thread>.msg` keyed on `CODEX_THREAD_ID`, `claude-<pane>.msg` keyed on the host pane's `$TMUX_PANE` — and `relay` reads the relevant file and forwards it. No dedupe — running `relay` twice on the same turn sends twice.
+  - `kibitz relay [text]` — forward the agent's own last assistant reply verbatim to its counterpart pane. With text, the reply goes out framed as a `CLAUDE:` (or `CODEX:`) block followed by a `USER:` block holding the text — your own note or question about that reply. From a claude host pane the relay is sent by the Claude `Stop` hook when the current turn ends (one attempt); it sends the reply that was shown above your input when you ran the command, so rewinding first is honored. From a codex reviewer pane it forwards codex's last reply immediately, read from the `codex-<thread>.msg` stash the codex `Stop` hook writes under `$XDG_CACHE_HOME/kibitz/` keyed on `CODEX_THREAD_ID`. No dedupe — running `relay` twice on the same turn sends twice.
 - `kibitz stop` / `kibitz restart` / `kibitz status` manage the pane lifecycle.
 - `kibitz uninstall` tears everything down cleanly.
 
@@ -100,11 +100,15 @@ kibitz status
 kibitz restart claude
 
 # Forward the agent's own last reply verbatim to the counterpart pane:
-#   codex reviewer pane → claude host  (header: [kibitz from:codex])
-#   claude host pane    → codex reviewer (header: [kibitz from:claude])
-# Fails if no turn has been stashed yet. Running it twice sends
-# twice — there's no dedupe.
+#   codex reviewer pane → claude host  (header: [kibitz from:codex]), sent now
+#   claude host pane    → codex reviewer (header: [kibitz from:claude]), sent
+#                         when the current turn ends; what you see above the
+#                         input is what goes out
+# Running it twice sends twice — there's no dedupe.
 kibitz relay
+
+# Same, with your own note appended as a USER block:
+kibitz relay "does the claim about X actually hold?"
 
 # Remove the Stop hook entries and delete all installed scripts.
 kibitz uninstall
@@ -191,13 +195,13 @@ And to `~/.codex/hooks.json`:
 
 Plus `[features] codex_hooks = true` in `~/.codex/config.toml` (codex won't fire hooks without it).
 
-At runtime both Stop hooks write relay payloads under `$XDG_CACHE_HOME/kibitz/` (falls back to `~/.cache/kibitz/`): the codex hook writes `codex-<thread>.msg` keyed on `CODEX_THREAD_ID`, and the Claude hook writes `claude-<pane>.msg` keyed on the host pane's `$TMUX_PANE` (with the leading `%` stripped). Each file is overwritten atomically at the end of each turn. Errors from the codex hook land in `$XDG_CACHE_HOME/kibitz/log`; errors from the Claude hook land in `~/.claude/kibitz-hook.log`.
+At runtime the codex Stop hook writes its relay payload `codex-<thread>.msg` under `$XDG_CACHE_HOME/kibitz/` (falls back to `~/.cache/kibitz/`), keyed on `CODEX_THREAD_ID` and overwritten atomically at the end of each codex turn. A claude host's `kibitz relay` writes nothing: it prints a `[kibitz] relay queued` line followed by your note, Claude Code records that output as the command's transcript entry whose parent links lead to whatever was visible above the input, and the Claude Stop hook that ends the turn follows those links to the reply it sends. It tries once; if the reviewer pane is gone or the send fails, it logs to `~/.claude/kibitz-hook.log` and drops it. Errors from the codex hook land in `$XDG_CACHE_HOME/kibitz/log`.
 
 ## Troubleshooting
 
 - **`tmux-bridge not found`** — run `kibitz install`, or check that `~/.local/bin` is on `PATH`.
 - **Hook not forwarding (Claude side)** — check `~/.claude/kibitz-hook.log`. The hook always exits 0 (so it can't block your session), and routes errors there.
-- **`kibitz relay` says `no relay payload`** — the relevant Stop hook hasn't written a stash for this pane/thread yet. From a codex reviewer pane: check `$XDG_CACHE_HOME/kibitz/log` for codex Stop hook errors and confirm `[features] codex_hooks = true` in `~/.codex/config.toml` — without it codex won't fire hooks at all. From a claude host pane: check `~/.claude/kibitz-hook.log`; the stash runs inside the same Stop hook that forwards exchanges, so if one is broken both are.
+- **`kibitz relay` says `no relay payload`** — the codex Stop hook hasn't written a stash for this thread yet. Check `$XDG_CACHE_HOME/kibitz/log` for codex Stop hook errors and confirm `[features] codex_hooks = true` in `~/.codex/config.toml` — without it codex won't fire hooks at all. A claude-host relay that never arrives means the Claude Stop hook didn't run or failed; check `~/.claude/kibitz-hook.log`, and note the hook only runs when Claude's turn ends.
 - **`kibitz relay` says `CODEX_THREAD_ID is not set`** — only the codex-reviewer path requires it; the claude-host path keys on `$TMUX_PANE`. You're likely running relay from a codex-labeled pane where codex didn't inherit the env var (unusual — it's normally exported automatically).
 - **`couldn't detect host agent`** — host detection is Linux-only (`/proc/$PPID/exe`). On macOS, or when running through an unusual wrapper, pass the agent explicitly: `kibitz start codex`.
 - **Stale reviewer pane** — if `kibitz status` reports a pane that no longer exists, something killed the pane outside of kibitz. Run `kibitz stop` to clear the label, then `kibitz start`.

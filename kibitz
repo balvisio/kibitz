@@ -697,14 +697,19 @@ PY
 # Dispatches on the current pane label:
 #   codex reviewer → claude host. Payload at ~/.cache/kibitz/codex-<CODEX_THREAD_ID>.msg
 #     (written by the codex Stop hook, keyed on CODEX_THREAD_ID which codex
-#     exports into the reviewer shell).
-#   claude host    → codex reviewer. Payload at ~/.cache/kibitz/claude-<pane>.msg
-#     (written by the Claude Stop hook, keyed on $TMUX_PANE — Claude doesn't
-#     export a thread/session id into spawned shells, so pane id is the only
-#     stable key the running shell can also observe).
+#     exports into the reviewer shell). Sent immediately.
+#   claude host    → codex reviewer. Nothing is sent here: the command only
+#     prints a marker line (plus the note). Claude Code records that output,
+#     and the Claude Stop hook sends the reply once the current turn ends —
+#     only then does the transcript hold this command with a parent link to
+#     the reply that was visible above the input when it ran, so a rewind
+#     before relaying is honored. Single attempt: a failure is logged and dropped.
 # No dedupe — running `relay` twice sends twice, matching the user's Unix
 # intuition that manual commands do what they say each time they're run.
+# Any arguments are the user's note about the reply: the payload is then
+# framed as an '<AGENT>:' block followed by a 'USER:' block holding the note.
 cmd_relay() {
+  local note="$*"
   in_tmux || die "not inside a tmux session (\$TMUX is unset)"
 
   local my_pane="${TMUX_PANE:-}"
@@ -713,36 +718,43 @@ cmd_relay() {
   local my_label
   my_label=$(tmux display-message -t "$my_pane" -p '#{@name}' 2>/dev/null || true)
 
-  local msg_path direction
-  if [[ "$my_label" == "codex" ]]; then
-    local thread_id="${CODEX_THREAD_ID:-}"
-    [[ -n "$thread_id" ]] \
-      || die "CODEX_THREAD_ID is not set — is this shell running inside codex?"
-    msg_path="$KIBITZ_CACHE_DIR/codex-$thread_id.msg"
-    direction="to_host"
-  elif [[ "$my_label" == "claude-reviewer" ]]; then
+  if [[ "$my_label" == "claude-reviewer" ]]; then
     die "relay from a claude-reviewer pane is not supported — only codex reviewer → host and claude host → codex reviewer are wired"
-  else
-    # Any non-reviewer pane: treat as a claude host. The stash is keyed on
-    # this pane's id, so two claude hosts across windows never collide.
-    msg_path="$KIBITZ_CACHE_DIR/claude-${my_pane#%}.msg"
-    direction="to_reviewer"
   fi
 
+  if [[ "$my_label" != "codex" ]]; then
+    # Any non-reviewer pane: treat as a claude host and queue for the Stop hook.
+    local reviewer_line
+    reviewer_line=$(find_reviewer_pane)
+    [[ -n "$reviewer_line" ]] \
+      || die "no reviewer pane in this window — run '$(basename "$0") start' first"
+    has_bridge || die "tmux-bridge not found in PATH (run: $(basename "$0") install)"
+    # Nothing is written anywhere: Claude Code records this output in the
+    # transcript, and the Claude Stop hook reacts to the marker line once.
+    # Exact line the Claude Stop hook matches (RELAY_LINE in kibitz_hook_stop.py).
+    info "relay queued - goes to the reviewer when this turn ends"
+    [[ -n "$note" ]] && printf '%s\n' "$note"
+    return 0
+  fi
+
+  local thread_id="${CODEX_THREAD_ID:-}"
+  [[ -n "$thread_id" ]] \
+    || die "CODEX_THREAD_ID is not set — is this shell running inside codex?"
+  local msg_path="$KIBITZ_CACHE_DIR/codex-$thread_id.msg"
   [[ -f "$msg_path" ]] \
-    || die "no relay payload at $msg_path — wait for the agent to finish a turn (the Stop hook writes this), then retry"
+    || die "no relay payload at $msg_path — wait for codex to finish a turn (the Stop hook writes this), then retry"
 
   local turn_id message
   _load_relay_payload "$msg_path" turn_id message
   [[ -n "$message" ]] || die "no 'message' field in $msg_path"
 
-  if [[ "$direction" == "to_host" ]]; then
-    _relay_to_host "$message"
-    info "relayed codex turn ${turn_id:-<no-id>} to host"
-  else
-    _relay_to_reviewer "$message"
-    info "relayed claude turn ${turn_id:-<no-id>} to reviewer"
+  if [[ -n "$note" ]]; then
+    while [[ "$message" == *$'\n' ]]; do message="${message%$'\n'}"; done
+    message="CODEX:"$'\n'"${message}"$'\n\n'"USER:"$'\n'"${note}"
   fi
+
+  _relay_to_host "$message"
+  info "relayed codex turn ${turn_id:-<no-id>} to host"
 }
 
 cmd_uninstall() {
@@ -799,7 +811,7 @@ usage() {
   cat <<EOF
 kibitz — run a sidecar reviewer agent (codex or claude) in a tmux split pane.
 
-Usage: $(basename "$0") {install|uninstall|start [agent]|stop|status|restart [agent]|send <text>|relay}
+Usage: $(basename "$0") {install|uninstall|start [agent]|stop|status|restart [agent]|send <text>|relay [text]}
 
 Commands:
   install          Install tmux-bridge, kibitz, and the hook scripts
@@ -825,12 +837,17 @@ Commands:
                    with a minimal '[kibitz from:<agent>]' header. Routes via the
                    pane-local @kibitz_host_pane option set at start time, so
                    concurrent reviewer pairs in different windows don't cross.
-  relay            Forward the agent's own last assistant reply verbatim to
-                   its counterpart pane. Dispatches on the current pane:
+  relay [text]     Forward the agent's own last assistant reply verbatim to
+                   its counterpart pane. With text, send it framed as a
+                   'CLAUDE:' (or 'CODEX:') block holding the reply followed
+                   by a 'USER:' block holding the text — your own note or
+                   question about that reply. Dispatches on the current pane:
                      codex reviewer → claude host (payload keyed on
-                       CODEX_THREAD_ID, stashed by the codex Stop hook).
-                     claude host    → codex reviewer (payload keyed on
-                       \$TMUX_PANE, stashed by the Claude Stop hook).
+                       CODEX_THREAD_ID, stashed by the codex Stop hook;
+                       sent immediately).
+                     claude host    → codex reviewer (queued; the Claude
+                       Stop hook sends the reply that was shown above your
+                       input when you ran the command, once the turn ends).
                    No dedupe: running 'relay' twice sends twice.
 
 Environment:
@@ -848,7 +865,7 @@ case "$1" in
   status)    shift; cmd_status ;;
   restart)   shift; cmd_restart "${1:-}" ;;
   send)      shift; cmd_send "$@" ;;
-  relay)     shift; cmd_relay ;;
+  relay)     shift; cmd_relay "$@" ;;
   -h|--help|help) usage ;;
   *) echo "unknown command: $1" >&2; usage; exit 2 ;;
 esac

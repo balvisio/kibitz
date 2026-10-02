@@ -35,6 +35,15 @@ def assistant(text):
     return {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}}
 
 
+def chain(entries):
+    """Give entries sequential uuids with each parented to the previous one."""
+    for i, entry in enumerate(entries):
+        entry["uuid"] = f"u{i}"
+        if i:
+            entry["parentUuid"] = f"u{i - 1}"
+    return entries
+
+
 def running(*task_ids):
     return [{"id": task_id, "type": "shell", "status": "running", "description": ""} for task_id in task_ids]
 
@@ -45,12 +54,11 @@ class StopHookTest(unittest.TestCase):
         root = Path(self.tmp.name)
         self.forwarded = []
         self.saved = {name: getattr(hook, name) for name in
-                      ("forward", "resolve_reviewer", "current_pane_label", "LAST_FORWARD_PATH", "CACHE_DIR")}
+                      ("forward", "resolve_reviewer", "current_pane_label", "LAST_FORWARD_PATH")}
         hook.forward = lambda pane, message: self.forwarded.append(message)
         hook.resolve_reviewer = lambda: ("%9", "codex")
         hook.current_pane_label = lambda: ""
         hook.LAST_FORWARD_PATH = root / "kibitz-last.txt"
-        hook.CACHE_DIR = root / "cache"
         self.transcript = root / "transcript.jsonl"
 
     def tearDown(self):
@@ -74,7 +82,14 @@ class StopHookTest(unittest.TestCase):
         self.forwarded.clear()
         sys.stdin = io.StringIO(json.dumps(payload))
         self.assertEqual(hook.main(), 0)
-        return [m.split("USER:\n", 1)[1].split("\n\nCLAUDE:\n", 1) for m in self.forwarded]
+        out = []
+        for m in self.forwarded:
+            body = m.split("\n\n", 1)[1]
+            if body.startswith("USER:\n"):
+                out.append(body[len("USER:\n"):].split("\n\nCLAUDE:\n", 1))
+            else:
+                out.append(body)
+        return out
 
     def test_plain_exchange_is_forwarded(self):
         self.assertEqual(self.stop([human("A"), assistant("a")], "a"), [["A", "a"]])
@@ -169,6 +184,95 @@ class StopHookTest(unittest.TestCase):
         entries = [human("Fix this bug"), launch("t1"), assistant("tests running")] + slash + [
             notification("t1"), assistant("Tests pass")]
         self.assertEqual(self.stop(entries, "Tests pass"), [["Fix this bug", "Tests pass"]])
+
+    @staticmethod
+    def relay_output(note=""):
+        return hook.RELAY_LINE + "\n" + (note + "\n" if note else "")
+
+    def shell_relay(self, parent, note=""):
+        tail = chain([human("<bash-input>kibitz relay note</bash-input>"),
+                      human(f"<bash-stdout>{self.relay_output(note)}</bash-stdout><bash-stderr></bash-stderr>"),
+                      assistant("Queued.")])
+        for e in tail:
+            e["uuid"] = "r-" + e["uuid"]
+            e["parentUuid"] = "r-" + e["parentUuid"] if "parentUuid" in e else parent
+        return tail
+
+    def tool_relay(self, note=""):
+        stdout = self.relay_output(note)
+        return [assistant("Relaying now."),
+                {"type": "assistant", "message": {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "toolu_r", "name": "Bash", "input": {"command": "kibitz relay"}}]}},
+                {"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_r", "content": stdout}]},
+                 "toolUseResult": {"stdout": stdout, "stderr": ""}},
+                assistant("Sent.")]
+
+    def test_relay_sends_reply_visible_when_command_ran(self):
+        entries = chain([human("A"), assistant("R0"), human("Q2"), assistant("R1")])
+        self.assertEqual(self.stop(entries + self.shell_relay("u1", "my note"), "Queued."),
+                         ["CLAUDE:\nR0\n\nUSER:\nmy note"])
+
+    def test_relay_without_note_is_verbatim(self):
+        entries = chain([human("A"), assistant("R0")])
+        self.assertEqual(self.stop(entries + self.shell_relay("u1"), "Queued."), ["R0"])
+
+    def test_relay_from_tool_call_skips_claudes_own_turn(self):
+        entries = chain([human("A"), assistant("R0"), human("relay that to codex")] + self.tool_relay("please check"))
+        self.assertEqual(self.stop(entries, "Sent."),
+                         ["CLAUDE:\nR0\n\nUSER:\nplease check", ["relay that to codex", "Sent."]])
+
+    def test_relay_is_sent_once_and_not_replayed_by_later_stops(self):
+        entries = chain([human("A"), assistant("R0")]) + self.shell_relay("u1", "note")
+        self.assertEqual(self.stop(entries, "Queued."), ["CLAUDE:\nR0\n\nUSER:\nnote"])
+        later = chain([human("B"), assistant("RB")])
+        later[0]["parentUuid"] = "r-u2"
+        self.assertEqual(self.stop(entries + later, "RB"), [["B", "RB"]])
+
+    def test_later_shell_command_turn_does_not_resend_earlier_relay(self):
+        entries = chain([human("Fix this bug"), assistant("I fixed the missing null check.")])
+        entries += self.shell_relay("u1", "Is this fix correct?")
+        self.assertEqual(self.stop(entries, "Queued."), ["CLAUDE:\nI fixed the missing null check.\n\nUSER:\nIs this fix correct?"])
+        git = chain([human("<bash-input>git status</bash-input>"),
+                     human("<bash-stdout>clean</bash-stdout><bash-stderr></bash-stderr>"),
+                     assistant("Your working tree is clean.")])
+        for e in git:
+            e["uuid"] = "g-" + e["uuid"]
+            e["parentUuid"] = "g-" + e["parentUuid"] if "parentUuid" in e else "r-u2"
+        self.assertEqual(self.stop(entries + git, "Your working tree is clean."), [])
+
+    def test_prompt_quoting_the_marker_is_not_a_relay(self):
+        quoted = "What does '[kibitz] relay queued' mean?"
+        entries = chain([human("A"), assistant("R0"), human(quoted + " /mute"), assistant("It is the marker line.")])
+        self.assertEqual(self.stop(entries, "It is the marker line."), [])
+        entries = chain([human("A"), assistant("R0"), human(quoted), assistant("It is the marker line.")])
+        self.assertEqual(self.stop(entries, "It is the marker line."), [[quoted, "It is the marker line."]])
+
+    def test_marker_inside_other_command_output_is_not_a_relay(self):
+        grep = f'RELAY_LINE = "{hook.RELAY_LINE}"'
+        for stdout in (grep, "something first\n" + hook.RELAY_LINE):
+            entries = chain([human("A"), assistant("R0"),
+                             human("<bash-input>rg RELAY_LINE hooks</bash-input>"),
+                             human(f"<bash-stdout>{stdout}\n</bash-stdout><bash-stderr></bash-stderr>"),
+                             assistant("That is the marker constant.")])
+            self.assertEqual(self.stop(entries, "That is the marker constant."), [], stdout)
+
+    def test_relay_without_reviewer_is_dropped(self):
+        entries = chain([human("A"), assistant("R0")]) + self.shell_relay("u1", "note")
+        hook.resolve_reviewer = lambda: None
+        self.assertEqual(self.stop(entries, "Queued."), [])
+        hook.resolve_reviewer = lambda: ("%9", "codex")
+        later = chain([human("B"), assistant("RB")])
+        later[0]["parentUuid"] = "r-u2"
+        self.assertEqual(self.stop(entries + later, "RB"), [["B", "RB"]])
+
+    def test_relay_send_failure_is_logged_not_raised(self):
+        entries = chain([human("A"), assistant("R0")]) + self.shell_relay("u1", "note")
+
+        def boom(pane, message):
+            raise RuntimeError("tmux-bridge down")
+        hook.forward = boom
+        self.assertEqual(self.stop(entries, "Queued."), [])
 
     def test_duplicate_stop_is_deduped(self):
         entries = [human("A"), assistant("a")]

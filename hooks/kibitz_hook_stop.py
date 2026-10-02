@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """kibitz_hook_stop — Claude Code Stop hook that forwards the latest exchange
-to a kibitz reviewer pane (codex or claude-reviewer) via tmux-bridge, and also
-stashes the host's last_assistant_message for manual `kibitz relay`.
+to a kibitz reviewer pane (codex or claude-reviewer) via tmux-bridge, and
+delivers relays queued by `kibitz relay` from the host pane.
 
 Invoked with the hook payload on stdin. Exits 0 unconditionally so hook
 failures never block the session; errors go to ~/.claude/kibitz-hook.log.
@@ -20,10 +20,17 @@ Claude Code also fires Stop when a turn merely pauses for background work
 <task-notification> user entry. Those interim replies are not forwarded: the
 exchange goes out once the work launched for the user's prompt has finished,
 attributed to that prompt rather than to the notification.
+
+`kibitz relay [note]` from the host pane sends nothing itself: it prints a
+marker line and the note. Claude Code records the command and its output
+after it exits, with a parent link to whatever was visible above the input at
+that moment — the only trace a conversation rewind leaves. At the Stop that
+ends the turn started by that command, this hook finds the recorded output,
+follows the links to the last assistant reply and sends it. One attempt; any
+failure is logged and dropped.
 """
 import hashlib
 import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -42,45 +49,11 @@ from kibitz_hook_common import (
     resolve_reviewer,
 )
 
-CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "kibitz"
-
 # toolUseResult keys under which Claude Code records the id of a task it put
 # in the background (Monitor and Workflow, Bash run_in_background, Agent). The
 # same id shows up in background_tasks[].id of the Stop payload and in the
 # <task-id> of the notification that later resumes the session.
 _TASK_ID_KEYS = ("taskId", "backgroundTaskId", "agentId")
-
-
-def stash_host_turn(pane_id, payload):
-    """Atomically write last_assistant_message to claude-<pane>.msg so a
-    manual `kibitz relay` from the same host pane can forward it to the
-    reviewer. Keyed on $TMUX_PANE because Claude Code — unlike codex — does
-    not export a session/thread ID into child shells, so pane_id is the only
-    stable identifier a spawned shell can observe.
-
-    Best-effort: any failure is logged and swallowed so the stash cannot
-    break the Stop hook's primary job (forwarding exchanges)."""
-    raw = payload.get("last_assistant_message") if isinstance(payload, dict) else None
-    if not isinstance(raw, str) or not raw.strip():
-        return
-
-    try:
-        CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        log(f"stash: cache dir create failed: {e}")
-        return
-
-    key = pane_id.lstrip("%")
-    msg_path = CACHE_DIR / f"claude-{key}.msg"
-    tmp_path = msg_path.with_suffix(".msg.tmp")
-    session_id = payload.get("session_id", "") if isinstance(payload, dict) else ""
-    body = {"turn_id": session_id, "session_id": session_id, "message": raw}
-    try:
-        with tmp_path.open("w") as f:
-            json.dump(body, f)
-        tmp_path.replace(msg_path)
-    except Exception as e:
-        log(f"stash: write failed for {msg_path}: {e}")
 
 
 def load_entries(transcript_path):
@@ -120,7 +93,92 @@ def launched_task_ids(entry):
     return {result[key] for key in _TASK_ID_KEYS if isinstance(result.get(key), str)}
 
 
-def current_exchange(transcript_path):
+RELAY_LINE = "[kibitz] relay queued - goes to the reviewer when this turn ends"
+
+
+def command_output(entry):
+    """Where a kibitz command's output lands in the transcript: a
+    <bash-stdout> record for `! kibitz ...`, or the Bash tool result when
+    Claude ran the command itself. Anything else — in particular a typed
+    prompt quoting the marker — is not command output."""
+    text = user_text(entry)
+    if text:
+        return text if text.lstrip().startswith("<bash-stdout>") else ""
+    result = entry.get("toolUseResult")
+    if isinstance(result, dict) and isinstance(result.get("stdout"), str):
+        return result["stdout"]
+    return ""
+
+
+def relay_note_lines(entry):
+    """The note lines of a `kibitz relay` run, when this entry records its
+    output: the launcher prints exactly RELAY_LINE first, then the note.
+    None for any other output, including text that merely contains the
+    marker (a grep of this file, a cat of the launcher)."""
+    output = command_output(entry)
+    if not output:
+        return None
+    clean = re.sub(r"\x1b\[[0-9;]*m", "", output)
+    m = re.search(r"<bash-stdout>(.*?)</bash-stdout>", clean, re.S)
+    lines = (m.group(1) if m else clean).splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    if not lines or lines[0].strip() != RELAY_LINE:
+        return None
+    return lines[1:]
+
+
+def queued_relay(entries):
+    """(anchor, note) for a `kibitz relay` run during the turn being stopped,
+    recognised by the line it printed; None when this turn has none. The
+    scan ends at whatever started the turn — a prompt, a notification or a
+    shell command's record — so an earlier relay is never picked up again."""
+    for entry in reversed(entries):
+        note_lines = relay_note_lines(entry)
+        if note_lines is not None:
+            return entry, "\n".join(note_lines).strip()
+        text = user_text(entry)
+        if not text:
+            continue
+        if is_task_notification(text) or is_command_text(text) or not is_skippable_user_text(text):
+            return None
+    return None
+
+
+def visible_reply(entries, anchor):
+    """Last assistant reply above the point where the relay command ran,
+    following parentUuid links. From a <bash-stdout> record the chain leads
+    straight there; from a Bash tool result it first crosses Claude's own
+    turn, so walk past the prompt that started that turn."""
+    by_uuid = {e.get("uuid"): e for e in entries if e.get("uuid")}
+    skip_to_prompt = not user_text(anchor)
+    entry = by_uuid.get(anchor.get("parentUuid"))
+    while entry is not None:
+        if skip_to_prompt:
+            text = user_text(entry)
+            if text and not is_skippable_user_text(text) and not is_task_notification(text):
+                skip_to_prompt = False
+        elif entry.get("type") == "assistant":
+            text = extract_text((entry.get("message") or {}).get("content"))
+            if text:
+                return text
+        entry = by_uuid.get(entry.get("parentUuid"))
+    return ""
+
+
+def send_queued_relay(pane_id, entries, anchor, note):
+    reply = visible_reply(entries, anchor)
+    if not reply:
+        log("relay: no assistant reply found above the relay command; dropped")
+        return
+    body = f"CLAUDE:\n{reply}\n\nUSER:\n{note}" if note else reply
+    try:
+        forward(pane_id, f"[kibitz from:claude]\n\n{body}")
+    except Exception as e:
+        log(f"relay: forward failed; dropped: {e}")
+
+
+def current_exchange(entries):
     """Return (prompt_text, tasks): the human prompt that owns the turn being
     stopped and the ids of every background task launched on its behalf.
 
@@ -135,7 +193,6 @@ def current_exchange(transcript_path):
     are flushed long before the Stop hook fires, so
     reading the transcript here is safe — unlike the final assistant text
     block, which is often still buffered at hook time."""
-    entries = load_entries(transcript_path)
     owner = None
     task_owner = {}
     tasks = {}
@@ -167,32 +224,27 @@ def main():
         return 0
 
     pane_label = current_pane_label()
-    my_pane = os.environ.get("TMUX_PANE", "")
-
-    # Stash the host's last_assistant_message for manual `kibitz relay`. Runs
-    # before any transcript/forward preconditions so relay still works when
-    # automatic forwarding is skipped (muted, deduped, reviewer pane gone).
-    # Scoped to non-reviewer panes: stashing a reviewer's own reply isn't
-    # wired into the relay flow and would just litter the cache dir.
-    if my_pane and pane_label not in REVIEWER_LABELS:
-        stash_host_turn(my_pane, payload)
 
     transcript = payload.get("transcript_path")
-    if not transcript:
-        return 0
-    tpath = Path(transcript)
-    if not tpath.is_file():
+    entries = load_entries(Path(transcript)) if transcript and Path(transcript).is_file() else None
+    if entries is None:
         return 0
 
     if pane_label in REVIEWER_LABELS:
         return 0
 
     reviewer = resolve_reviewer()
+    relay = queued_relay(entries)
+    if relay and not reviewer:
+        log("relay: no reviewer pane in this window; dropped")
     if not reviewer:
         return 0
     pane_id, _reviewer_label = reviewer
 
-    user_text_raw, launched = current_exchange(tpath)
+    if relay:
+        send_queued_relay(pane_id, entries, *relay)
+
+    user_text_raw, launched = current_exchange(entries)
     if not user_text_raw:
         return 0
 
