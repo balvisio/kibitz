@@ -709,6 +709,11 @@ PY
 # Any arguments are the user's note about the reply: the payload is then
 # framed as an '<AGENT>:' block followed by a 'USER:' block holding the note.
 cmd_relay() {
+  local force=0
+  if [[ "${1:-}" == "--force" ]]; then
+    force=1
+    shift
+  fi
   local note="$*"
   in_tmux || die "not inside a tmux session (\$TMUX is unset)"
 
@@ -731,9 +736,17 @@ cmd_relay() {
     has_bridge || die "tmux-bridge not found in PATH (run: $(basename "$0") install)"
     # Nothing is written anywhere: Claude Code records this output in the
     # transcript, and the Claude Stop hook reacts to the marker line once.
-    # Exact line the Claude Stop hook matches (RELAY_LINE in kibitz_hook_stop.py).
-    info "relay queued - goes to the reviewer when this turn ends"
+    # Exact lines the Claude Stop hook matches (RELAY_LINE / RELAY_LINE_FORCE
+    # in kibitz_hook_stop.py). Without --force the hook submits with Tab while
+    # codex is mid-task, so codex queues it instead of being interrupted.
+    if (( force )); then
+      info "relay queued (force) - goes to the reviewer when this turn ends, even mid-task"
+    else
+      info "relay queued - goes to the reviewer when this turn ends"
+    fi
     [[ -n "$note" ]] && printf '%s\n' "$note"
+    # On stderr so it never becomes part of the note the hook extracts.
+    printf '%s\n' "[kibitz] host agent: the Stop hook delivers this relay when your turn ends; acknowledge in one short sentence and take no other action." >&2
     return 0
   fi
 
@@ -811,7 +824,7 @@ usage() {
   cat <<EOF
 kibitz — run a sidecar reviewer agent (codex or claude) in a tmux split pane.
 
-Usage: $(basename "$0") {install|uninstall|start [agent]|stop|status|restart [agent]|send <text>|relay [text]}
+Usage: $(basename "$0") {install|uninstall|start [agent]|stop|status|restart [agent]|send <text>|relay [--force] [text]}
 
 Commands:
   install          Install tmux-bridge, kibitz, and the hook scripts
@@ -837,7 +850,8 @@ Commands:
                    with a minimal '[kibitz from:<agent>]' header. Routes via the
                    pane-local @kibitz_host_pane option set at start time, so
                    concurrent reviewer pairs in different windows don't cross.
-  relay [text]     Forward the agent's own last assistant reply verbatim to
+  relay [--force] [text]
+                   Forward the agent's own last assistant reply verbatim to
                    its counterpart pane. With text, send it framed as a
                    'CLAUDE:' (or 'CODEX:') block holding the reply followed
                    by a 'USER:' block holding the text — your own note or
@@ -848,6 +862,9 @@ Commands:
                      claude host    → codex reviewer (queued; the Claude
                        Stop hook sends the reply that was shown above your
                        input when you ran the command, once the turn ends).
+                       If codex is mid-task the message is submitted with
+                       Tab so codex queues it for afterwards; --force
+                       submits with Enter and interrupts.
                    No dedupe: running 'relay' twice sends twice.
 
 Environment:

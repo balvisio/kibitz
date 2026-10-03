@@ -10,7 +10,7 @@ Named after the Yiddish *kibbitzer* — the spectator who can't resist offering 
 - A Claude Code `Stop` hook extracts the latest user + assistant turn from the session transcript and forwards them to the reviewer pane using `tmux-bridge`.
 - The reviewer sends messages back two ways, both prepend a `[kibitz from:<agent>]` header so the host can tell them apart from real user input:
   - `kibitz send "<text>"` — send custom text.
-  - `kibitz relay [text]` — forward the agent's own last assistant reply verbatim to its counterpart pane. With text, the reply goes out framed as a `CLAUDE:` (or `CODEX:`) block followed by a `USER:` block holding the text — your own note or question about that reply. From a claude host pane the relay is sent by the Claude `Stop` hook when the current turn ends (one attempt); it sends the reply that was shown above your input when you ran the command, so rewinding first is honored. From a codex reviewer pane it forwards codex's last reply immediately, read from the `codex-<thread>.msg` stash the codex `Stop` hook writes under `$XDG_CACHE_HOME/kibitz/` keyed on `CODEX_THREAD_ID`. No dedupe — running `relay` twice on the same turn sends twice.
+  - `kibitz relay [text]` — forward the agent's own last assistant reply verbatim to its counterpart pane. With text, the reply goes out framed as a `CLAUDE:` (or `CODEX:`) block followed by a `USER:` block holding the text — your own note or question about that reply. From a claude host pane the relay is sent by the Claude `Stop` hook when the current turn ends (one attempt); it sends the reply that was shown above your input when you ran the command, so rewinding first is honored. Deliveries (relays and forwarded exchanges alike) check codex's rollout log first: if codex is mid-task the text is submitted with Tab, which codex queues for after the current task; `kibitz relay --force <text>` submits with Enter and interrupts. From a codex reviewer pane it forwards codex's last reply immediately, read from the `codex-<thread>.msg` stash the codex `Stop` hook writes under `$XDG_CACHE_HOME/kibitz/` keyed on `CODEX_THREAD_ID`. No dedupe — running `relay` twice on the same turn sends twice.
 - `kibitz stop` / `kibitz restart` / `kibitz status` manage the pane lifecycle.
 - `kibitz uninstall` tears everything down cleanly.
 
@@ -73,7 +73,7 @@ What install does:
 1. Verifies `python3` is on PATH.
 2. Copies `scripts/tmux-bridge`, `kibitz`, and the `hooks/kibitz_*.py` scripts (Claude hooks + `kibitz_codex_stop.py`) into `~/.local/bin/`.
 3. Merges the Stop and UserPromptSubmit hook entries from `hooks/kibitz_hook.json` into `~/.claude/settings.json` (idempotent — won't duplicate on reinstall, preserves any other hooks you have).
-4. Merges the codex Stop hook from `hooks/kibitz_codex_hooks.json` into `~/.codex/hooks.json` (same idempotent behavior), and sets `[features] codex_hooks = true` in `~/.codex/config.toml` so codex actually fires hooks. If `codex_hooks` is already set to `false` the installer warns and leaves it alone.
+4. Merges the codex SessionStart and Stop hooks from `hooks/kibitz_codex_hooks.json` into `~/.codex/hooks.json` (same idempotent behavior), and sets `[features] codex_hooks = true` in `~/.codex/config.toml` so codex actually fires hooks. If `codex_hooks` is already set to `false` the installer warns and leaves it alone.
 5. Adds `~/.local/bin/` to `PATH` in your shell rc (`.zshrc` / `.bashrc` / `.profile`) if it isn't already.
 6. Warns if `codex` or `claude` binaries are missing (non-fatal).
 

@@ -12,6 +12,7 @@ from pathlib import Path
 REVIEWER_LABELS = ("codex", "claude-reviewer")
 LOG_PATH = Path.home() / ".claude" / "kibitz-hook.log"
 LAST_FORWARD_PATH = Path.home() / ".claude" / "kibitz-last.txt"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "kibitz"
 
 # Case-sensitive. /MUTE, /Tee, etc. fall through as normal text — keeping the
 # surface area narrow avoids accidentally swallowing content that merely
@@ -163,10 +164,59 @@ def resolve_reviewer():
     return None
 
 
-def forward(target, payload):
+_LIFECYCLE = ("task_started", "task_complete", "turn_aborted")
+
+
+def last_lifecycle_event(path):
+    """Type of the latest task_started / task_complete / turn_aborted event in
+    a codex rollout log, scanning backward block by block so a long tool
+    result after the event cannot hide it. None if there is none."""
+    with path.open("rb") as f:
+        f.seek(0, 2)
+        pos = f.tell()
+        buf = b""
+        while pos > 0:
+            step = min(65536, pos)
+            pos -= step
+            f.seek(pos)
+            buf = f.read(step) + buf
+            lines = buf.split(b"\n")
+            first_complete = 0 if pos == 0 else 1
+            for line in reversed(lines[first_complete:]):
+                if not any(kind.encode() in line for kind in _LIFECYCLE):
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(event, dict) and event.get("type") == "event_msg":
+                    kind = (event.get("payload") or {}).get("type")
+                    if kind in _LIFECYCLE:
+                        return kind
+            buf = lines[0] if first_complete else b""
+    return None
+
+
+def reviewer_busy(pane_id):
+    """True while the codex reviewer in `pane_id` is inside a turn, read from
+    its rollout log — the path the codex-side hook records as
+    pane-<id>.rollout. Unknown or unreadable means not busy."""
+    try:
+        rollout = Path((CACHE_DIR / f"pane-{pane_id.lstrip('%')}.rollout").read_text().strip())
+        return last_lifecycle_event(rollout) == "task_started"
+    except Exception:
+        return False
+
+
+def forward(target, payload, force=False):
     """`target` can be a tmux pane_id (e.g. `%5`) or a @name label — tmux-bridge
     accepts either. We pass pane_id so routing stays pinned to the reviewer in
-    *this* window, regardless of other reviewers elsewhere on the server."""
+    *this* window, regardless of other reviewers elsewhere on the server.
+
+    While the reviewer is mid-turn the text is submitted with Tab, which codex
+    queues for after the current task instead of interrupting it; `force`
+    submits with Enter regardless."""
+    key = "Enter" if force or not reviewer_busy(target) else "Tab"
     subprocess.run(
         ["tmux-bridge", "read", target, "1"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -184,7 +234,7 @@ def forward(target, payload):
         check=True, timeout=5,
     )
     subprocess.run(
-        ["tmux-bridge", "keys", target, "Enter"],
+        ["tmux-bridge", "keys", target, key],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         check=True, timeout=5,
     )

@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
 os.environ["TMUX_PANE"] = "%1"
 
+import kibitz_hook_common as common  # noqa: E402
 import kibitz_hook_stop as hook  # noqa: E402
 
 
@@ -55,7 +56,9 @@ class StopHookTest(unittest.TestCase):
         self.forwarded = []
         self.saved = {name: getattr(hook, name) for name in
                       ("forward", "resolve_reviewer", "current_pane_label", "LAST_FORWARD_PATH")}
-        hook.forward = lambda pane, message: self.forwarded.append(message)
+        self.saved_log = common.LOG_PATH
+        common.LOG_PATH = root / "hook.log"
+        hook.forward = lambda pane, message, force=False: self.forwarded.append(message)
         hook.resolve_reviewer = lambda: ("%9", "codex")
         hook.current_pane_label = lambda: ""
         hook.LAST_FORWARD_PATH = root / "kibitz-last.txt"
@@ -64,6 +67,7 @@ class StopHookTest(unittest.TestCase):
     def tearDown(self):
         for name, value in self.saved.items():
             setattr(hook, name, value)
+        common.LOG_PATH = self.saved_log
         self.tmp.cleanup()
 
     def stop(self, entries, last_message, background_tasks=()):
@@ -191,7 +195,9 @@ class StopHookTest(unittest.TestCase):
 
     def shell_relay(self, parent, note=""):
         tail = chain([human("<bash-input>kibitz relay note</bash-input>"),
-                      human(f"<bash-stdout>{self.relay_output(note)}</bash-stdout><bash-stderr></bash-stderr>"),
+                      human(f"<bash-stdout>{self.relay_output(note)}"
+                            "[kibitz] host agent: the Stop hook delivers this relay when your turn ends; "
+                            "acknowledge in one short sentence and take no other action.\n</bash-stdout><bash-stderr></bash-stderr>"),
                       assistant("Queued.")])
         for e in tail:
             e["uuid"] = "r-" + e["uuid"]
@@ -212,6 +218,17 @@ class StopHookTest(unittest.TestCase):
         entries = chain([human("A"), assistant("R0"), human("Q2"), assistant("R1")])
         self.assertEqual(self.stop(entries + self.shell_relay("u1", "my note"), "Queued."),
                          ["CLAUDE:\nR0\n\nUSER:\nmy note"])
+
+    def test_forced_relay_is_passed_through_as_force(self):
+        seen = []
+        hook.forward = lambda pane, message, force=False: seen.append(force)
+        entries = chain([human("A"), assistant("R0")])
+        tail = self.shell_relay("u1", "note")
+        self.stop(entries + tail, "Queued.")
+        forced = self.shell_relay("u1", "note")
+        forced[1]["message"]["content"] = f"<bash-stdout>{hook.RELAY_LINE_FORCE}\nnote\n</bash-stdout><bash-stderr></bash-stderr>"
+        self.stop(entries + forced, "Queued.")
+        self.assertEqual(seen, [False, True])
 
     def test_relay_without_note_is_verbatim(self):
         entries = chain([human("A"), assistant("R0")])
@@ -269,7 +286,7 @@ class StopHookTest(unittest.TestCase):
     def test_relay_send_failure_is_logged_not_raised(self):
         entries = chain([human("A"), assistant("R0")]) + self.shell_relay("u1", "note")
 
-        def boom(pane, message):
+        def boom(pane, message, force=False):
             raise RuntimeError("tmux-bridge down")
         hook.forward = boom
         self.assertEqual(self.stop(entries, "Queued."), [])

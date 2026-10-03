@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
-"""kibitz_codex_stop — Codex Stop hook that persists last_assistant_message so
-`kibitz relay` can forward it to the host pane.
+"""kibitz_codex_stop — Codex hook (SessionStart and Stop).
+
+On every event it records which rollout log belongs to this tmux pane
+(pane-<id>.rollout in the cache dir), so the Claude-side hook can read the
+rollout's tail and tell whether codex is mid-turn before delivering: busy
+means submit with Tab (codex queues it), idle means Enter.
+
+On Stop it also persists last_assistant_message so `kibitz relay` can
+forward it to the host pane.
 
 Invoked with the hook payload on stdin. Exits 0 with empty stdout
 unconditionally so hook failures never block the codex session; errors go
@@ -29,6 +36,28 @@ def log(msg):
         pass
 
 
+def record_rollout(payload):
+    """Remember which rollout log belongs to this pane. Codex passes the path
+    as transcript_path; fall back to finding it by session id."""
+    pane = os.environ.get("TMUX_PANE", "").lstrip("%")
+    if not pane:
+        return
+    path = payload.get("transcript_path")
+    if not isinstance(path, str) or not path:
+        session = payload.get("session_id") or os.environ.get("CODEX_THREAD_ID") or ""
+        matches = sorted(Path.home().glob(f".codex/sessions/*/*/*/rollout-*-{session}.jsonl")) if session else []
+        if not matches:
+            return
+        path = str(matches[-1])
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp_path = CACHE_DIR / f"pane-{pane}.rollout.tmp"
+        tmp_path.write_text(path)
+        tmp_path.replace(CACHE_DIR / f"pane-{pane}.rollout")
+    except Exception as e:
+        log(f"rollout mapping write failed: {e}")
+
+
 def main():
     try:
         payload = json.load(sys.stdin)
@@ -39,6 +68,8 @@ def main():
     if not isinstance(payload, dict):
         log(f"payload not a dict: {type(payload).__name__}")
         return 0
+
+    record_rollout(payload)
 
     message = payload.get("last_assistant_message")
     if not isinstance(message, str) or not message.strip():

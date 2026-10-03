@@ -94,6 +94,10 @@ def launched_task_ids(entry):
 
 
 RELAY_LINE = "[kibitz] relay queued - goes to the reviewer when this turn ends"
+RELAY_LINE_FORCE = "[kibitz] relay queued (force) - goes to the reviewer when this turn ends, even mid-task"
+# The launcher's instruction to the host agent; Claude Code records stderr
+# together with stdout, so it must be dropped from the note.
+RELAY_HINT_PREFIX = "[kibitz] host agent:"
 
 
 def command_output(entry):
@@ -111,10 +115,10 @@ def command_output(entry):
 
 
 def relay_note_lines(entry):
-    """The note lines of a `kibitz relay` run, when this entry records its
-    output: the launcher prints exactly RELAY_LINE first, then the note.
-    None for any other output, including text that merely contains the
-    marker (a grep of this file, a cat of the launcher)."""
+    """(note lines, forced) of a `kibitz relay` run, when this entry records
+    its output: the launcher prints exactly RELAY_LINE or RELAY_LINE_FORCE
+    first, then the note. None for any other output, including text that
+    merely contains the marker (a grep of this file, a cat of the launcher)."""
     output = command_output(entry)
     if not output:
         return None
@@ -123,20 +127,22 @@ def relay_note_lines(entry):
     lines = (m.group(1) if m else clean).splitlines()
     while lines and not lines[0].strip():
         lines.pop(0)
-    if not lines or lines[0].strip() != RELAY_LINE:
+    if not lines or lines[0].strip() not in (RELAY_LINE, RELAY_LINE_FORCE):
         return None
-    return lines[1:]
+    note_lines = [line for line in lines[1:] if not line.strip().startswith(RELAY_HINT_PREFIX)]
+    return note_lines, lines[0].strip() == RELAY_LINE_FORCE
 
 
 def queued_relay(entries):
-    """(anchor, note) for a `kibitz relay` run during the turn being stopped,
-    recognised by the line it printed; None when this turn has none. The
+    """(anchor, note, forced) for a `kibitz relay` run during the turn being
+    stopped, recognised by the line it printed; None when this turn has none. The
     scan ends at whatever started the turn — a prompt, a notification or a
     shell command's record — so an earlier relay is never picked up again."""
     for entry in reversed(entries):
-        note_lines = relay_note_lines(entry)
-        if note_lines is not None:
-            return entry, "\n".join(note_lines).strip()
+        found = relay_note_lines(entry)
+        if found is not None:
+            note_lines, forced = found
+            return entry, "\n".join(note_lines).strip(), forced
         text = user_text(entry)
         if not text:
             continue
@@ -166,14 +172,14 @@ def visible_reply(entries, anchor):
     return ""
 
 
-def send_queued_relay(pane_id, entries, anchor, note):
+def send_queued_relay(pane_id, entries, anchor, note, force):
     reply = visible_reply(entries, anchor)
     if not reply:
         log("relay: no assistant reply found above the relay command; dropped")
         return
     body = f"CLAUDE:\n{reply}\n\nUSER:\n{note}" if note else reply
     try:
-        forward(pane_id, f"[kibitz from:claude]\n\n{body}")
+        forward(pane_id, f"[kibitz from:claude]\n\n{body}", force=force)
     except Exception as e:
         log(f"relay: forward failed; dropped: {e}")
 
