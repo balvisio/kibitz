@@ -5,7 +5,21 @@
 # the tmux command-string boundary).
 set -euo pipefail
 
-agent="${1:?usage: kibitz_reviewer_launch [codex|claude]}"
+agent="${1:?usage: kibitz_reviewer_launch codex|claude | resume codex|claude SESSION}"
+shift
+if [[ "$agent" == resume ]]; then
+  [[ $# -eq 2 ]] || { echo "usage: kibitz_reviewer_launch resume codex|claude SESSION" >&2; exit 2; }
+  agent="$1"
+  session="$2"
+  [[ -n "$session" ]] || { echo "conversation ID is required" >&2; exit 2; }
+  case "$agent" in
+    codex) set -- resume "$session" ;;
+    claude) set -- --resume "$session" ;;
+  esac
+elif [[ $# -ne 0 ]]; then
+  echo "use kibitz_reviewer_launch resume codex|claude SESSION to resume a reviewer" >&2
+  exit 2
+fi
 
 case "$agent" in
   codex)
@@ -17,15 +31,15 @@ case "$agent" in
     if [[ -f "$role_file" ]]; then
       exec codex --no-daemon \
         --config sandbox_workspace_write.network_access=true \
-        --config developer_instructions="$(<"$role_file")"
+        --config developer_instructions="$(<"$role_file")" "$@"
     fi
-    exec codex --no-daemon --config sandbox_workspace_write.network_access=true
+    exec codex --no-daemon --config sandbox_workspace_write.network_access=true "$@"
     ;;
   claude)
     if [[ -f "$HOME/.claude/agents/kibitz-reviewer.md" ]]; then
-      exec claude --agent kibitz-reviewer
+      exec claude --agent kibitz-reviewer "$@"
     fi
-    exec claude
+    exec claude "$@"
     ;;
   *)
     echo "kibitz_reviewer_launch: unknown agent '$agent'" >&2

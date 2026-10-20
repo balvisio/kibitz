@@ -200,6 +200,13 @@ Plus `[features] codex_hooks = true` in `~/.codex/config.toml` (codex won't fire
 
 At runtime the codex Stop hook writes its relay payload `codex-<thread>.msg` under `$XDG_CACHE_HOME/kibitz/` (falls back to `~/.cache/kibitz/`), keyed on `CODEX_THREAD_ID` and overwritten atomically at the end of each codex turn. A claude host's `kibitz relay` writes nothing: it prints a `[kibitz] relay queued` line followed by your note, Claude Code records that output as the command's transcript entry whose parent links lead to whatever was visible above the input, and the Claude Stop hook that ends the turn follows those links to the reply it sends. It tries once; if the reviewer pane is gone or the send fails, it logs to `~/.claude/kibitz-hook.log` and drops it. Errors from the codex hook land in `$XDG_CACHE_HOME/kibitz/log`.
 
+## Conversation recovery
+
+For tmux-agent-indicator recovery, update both packages before saving a Kibitz pair.
+The saved host/reviewer link is rebuilt when tmux restarts, and the reviewer reopens
+with its existing conversation and Kibitz role settings. The launcher accepts
+`kibitz_reviewer_launch resume codex SESSION` or `kibitz_reviewer_launch resume claude SESSION`.
+
 ## Troubleshooting
 
 - **`tmux-bridge not found`** — run `kibitz install`, or check that `~/.local/bin` is on `PATH`.
