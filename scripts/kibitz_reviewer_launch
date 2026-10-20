@@ -13,12 +13,13 @@ case "$agent" in
     # network_access=true punches a hole in codex's workspace-write seatbelt
     # for outbound sockets — without it, tmux(1) inside this pane can't reach
     # /private/tmp/tmux-*/default, so `kibitz send`/`status` silently fail.
+    # Keep Codex and its hooks in the pane's process tree.
     if [[ -f "$role_file" ]]; then
-      exec codex \
+      exec codex --no-daemon \
         --config sandbox_workspace_write.network_access=true \
         --config developer_instructions="$(<"$role_file")"
     fi
-    exec codex --config sandbox_workspace_write.network_access=true
+    exec codex --no-daemon --config sandbox_workspace_write.network_access=true
     ;;
   claude)
     if [[ -f "$HOME/.claude/agents/kibitz-reviewer.md" ]]; then

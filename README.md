@@ -46,6 +46,9 @@ Claude itself still sees the `/mute` or `/tee` suffix in your prompt — Claude 
 - `curl` or `wget` (for install)
 - One of `codex` or `claude` CLIs on PATH for whichever agents you want to run
 
+Codex reviewers run with `--no-daemon` so their hooks stay in the tmux pane's process tree.
+Use a Codex version that supports this option.
+
 ## Install
 
 One-liner (no checkout needed):

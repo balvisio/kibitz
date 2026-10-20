@@ -559,6 +559,9 @@ cmd_start() {
   else
     warn "'$LAUNCHER_NAME' not on PATH — launching $binary without reviewer role prompt (run 'kibitz install' to fix)"
     launch_cmd="$binary"
+    if [[ "$agent" == codex ]]; then
+      launch_cmd+=" --no-daemon"
+    fi
   fi
 
   local host_pane="${TMUX_PANE:-}"
