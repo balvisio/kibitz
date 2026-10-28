@@ -149,18 +149,17 @@ def resolve_reviewer():
         return None
     try:
         r = subprocess.run(
-            ["tmux", "list-panes", "-t", host_pane, "-F", "#{pane_id} #{@name}"],
+            ["tmux", "list-panes", "-t", host_pane, "-F", "#{pane_id} #{@name} #{@kibitz_host_pane}"],
             capture_output=True, text=True, check=True, timeout=5,
         )
     except Exception:
         return None
     for line in r.stdout.splitlines():
-        parts = line.split(None, 1)
-        if len(parts) != 2:
-            continue
-        pane_id, label = parts[0], parts[1].strip()
-        if label in REVIEWER_LABELS:
-            return pane_id, label
+        parts = line.split()
+        if len(parts) == 3:
+            pane_id, label, host = parts
+            if label in REVIEWER_LABELS and host == host_pane:
+                return pane_id, label
     return None
 
 

@@ -5,6 +5,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 _tmp = tempfile.TemporaryDirectory()
@@ -16,6 +17,11 @@ import kibitz_codex_stop as codex_hook  # noqa: E402
 
 
 class CodexHookTest(unittest.TestCase):
+    def setUp(self):
+        self.environment = patch.dict(os.environ, {"CODEX_THREAD_ID": ""})
+        self.environment.start()
+        self.addCleanup(self.environment.stop)
+
     def run_hook(self, payload):
         os.environ["TMUX_PANE"] = "%7"
         sys.stdin = io.StringIO(json.dumps(payload))

@@ -33,6 +33,8 @@ import hashlib
 import json
 import re
 import sys
+
+from kibitz_notifications import notify, remembered_prompt, forget_prompt
 from pathlib import Path
 
 from kibitz_hook_common import (
@@ -184,7 +186,7 @@ def send_queued_relay(pane_id, entries, anchor, note, force):
         log(f"relay: forward failed; dropped: {e}")
 
 
-def current_exchange(entries):
+def current_exchange(entries, include_prompt_id=False):
     """Return (prompt_text, tasks): the human prompt that owns the turn being
     stopped and the ids of every background task launched on its behalf.
 
@@ -218,8 +220,10 @@ def current_exchange(entries):
         elif not is_skippable_user_text(text):
             owner = i
     if owner is None:
-        return None, set()
-    return user_text(entries[owner]), tasks.get(owner, set())
+        result = (None, set(), "")
+    else:
+        result = (user_text(entries[owner]), tasks.get(owner, set()), entries[owner].get("promptId", ""))
+    return result if include_prompt_id else result[:2]
 
 
 def main():
@@ -234,7 +238,10 @@ def main():
     transcript = payload.get("transcript_path")
     entries = load_entries(Path(transcript)) if transcript and Path(transcript).is_file() else None
     if entries is None:
-        return 0
+        if remembered_prompt(payload) is None:
+            notify("fail", payload)
+            return 0
+        entries = []
 
     if pane_label in REVIEWER_LABELS:
         return 0
@@ -250,14 +257,31 @@ def main():
     if relay:
         send_queued_relay(pane_id, entries, *relay)
 
-    user_text_raw, launched = current_exchange(entries)
+    user_text_raw, launched, owner_prompt_id = current_exchange(entries, include_prompt_id=True)
+    notification_payload = dict(payload)
+    # Fast replies can reach Stop before the transcript writer flushes the user
+    # entry. Prompt-time metadata gives an exact fallback without guessing from
+    # the previous exchange in the transcript.
+    cached_prompt = remembered_prompt(payload)
+    prompt_present = any(entry.get("promptId") == payload.get("prompt_id")
+                         and entry.get("type") == "user" for entry in entries) if payload.get("prompt_id") else True
+    if cached_prompt is not None and not prompt_present:
+        user_text_raw, owner_prompt_id = cached_prompt, payload.get("prompt_id", "")
+        launched = {task["id"] for task in payload.get("background_tasks") or []
+                    if isinstance(task, dict) and isinstance(task.get("id"), str)}
+    if owner_prompt_id:
+        notification_payload["prompt_id"] = owner_prompt_id
     if not user_text_raw:
+        notify("skip", notification_payload, pane_id)
+        forget_prompt(notification_payload)
         return 0
 
     # Don't relay replies to reviewer-originated messages back to the reviewer
     # — otherwise "[kibitz from:codex] hi" -> claude replies "hi" -> forwarded
     # to codex -> codex replies -> loop.
     if is_reviewer_originated(user_text_raw):
+        notify("skip", notification_payload, pane_id)
+        forget_prompt(notification_payload)
         return 0
 
     user_text, directive = parse_directive(user_text_raw)
@@ -266,6 +290,10 @@ def main():
     # reply for it. Option B falls out of this too: a bare /mute or /tee leaves
     # user_text empty with a directive set, and we return here.
     if directive:
+        # /tee already registered its delivery at submit time; do not clear it.
+        if directive == "mute":
+            notify("skip", notification_payload, pane_id)
+        forget_prompt(notification_payload)
         return 0
 
     # Stop also fires when the turn only pauses for background work that will
@@ -281,11 +309,13 @@ def main():
     raw = payload.get("last_assistant_message") if isinstance(payload, dict) else None
     assistant_text = raw.strip() if isinstance(raw, str) else ""
     if not assistant_text:
+        notify("skip", notification_payload, pane_id)
+        forget_prompt(notification_payload)
         return 0
 
     session_id = payload.get("session_id", "") if isinstance(payload, dict) else ""
     fingerprint = hashlib.sha256(
-        f"{session_id}\n{user_text}\n{assistant_text}".encode("utf-8")
+        f"{session_id}\n{notification_payload.get('prompt_id', '')}\n{user_text}\n{assistant_text}".encode("utf-8")
     ).hexdigest()
     try:
         last_fp = LAST_FORWARD_PATH.read_text().strip()
@@ -294,6 +324,7 @@ def main():
     except Exception:
         last_fp = ""
     if fingerprint == last_fp:
+        forget_prompt(notification_payload)
         return 0
 
     message = (
@@ -302,6 +333,7 @@ def main():
         f"CLAUDE:\n{assistant_text}"
     )
 
+    notify("queue", notification_payload, pane_id, message)
     try:
         forward(pane_id, message)
         try:
@@ -309,7 +341,9 @@ def main():
         except Exception:
             pass
     except Exception as e:
+        notify("fail", notification_payload, pane_id)
         log(f"forward failed: {e}")
+    forget_prompt(notification_payload)
 
     return 0
 

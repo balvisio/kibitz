@@ -38,6 +38,18 @@ Append one of these tokens to the end of your message to change what the reviewe
 
 Claude itself still sees the `/mute` or `/tee` suffix in your prompt — Claude Code hooks can observe a prompt but can't rewrite it in place. Treat the trailing directive as benign noise; the model ignores it.
 
+### Completion sounds with tmux-agent-indicator
+
+Update and reinstall both Kibitz and tmux-agent-indicator to group completion sounds. A window rings
+once after Claude and its reviewer are ready, including reviews queued behind earlier work. `/mute`
+needs no review; `/tee` waits for the review started when you submitted the prompt. Ctrl+C cancels the
+interrupted review without announcing successful completion. If Codex returns a queued review to its
+input box, tracking resumes when you submit it; discarding the draft does not block later alerts.
+
+The integration uses Claude prompt IDs and the reviewer's turn IDs. Delivery failures are logged in
+`~/.claude/kibitz-hook.log`; the indicator also exposes `@agent-indicator-notification-error` on the
+window. Restart the pair after resolving a failed delivery. Kibitz works without the indicator installed.
+
 ## Requirements
 
 - Linux (host detection reads `/proc`; macOS fallback is explicit-arg-only)
