@@ -46,6 +46,7 @@ from kibitz_hook_common import (
     is_command_text,
     is_reviewer_originated,
     is_skippable_user_text,
+    is_task_notification,
     log,
     parse_directive,
     resolve_reviewer,
@@ -82,10 +83,6 @@ def user_text(entry):
     if not isinstance(msg, dict):
         return ""
     return extract_text(msg.get("content"))
-
-
-def is_task_notification(text):
-    return text.lstrip().startswith("<task-notification>")
 
 
 def launched_task_ids(entry):

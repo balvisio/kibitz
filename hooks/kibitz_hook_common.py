@@ -91,6 +91,11 @@ def is_command_text(text):
     return s.startswith(_SHELL_PREFIXES)
 
 
+def is_task_notification(text):
+    """A background-task wakeup continues its owning human prompt."""
+    return text.lstrip().startswith("<task-notification>")
+
+
 def is_reviewer_originated(text):
     """Return True if the user message was relayed from the reviewer via
     `kibitz send` — those carry a '[kibitz from:<agent>]' header. Replies to

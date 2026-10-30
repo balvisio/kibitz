@@ -82,6 +82,28 @@ class HandoffTest(unittest.TestCase):
         self.finish(owner='original')
         self.assertEqual(self.events, [('queue','original')])
 
+    def test_background_wakeups_do_not_reserve_or_cache_a_new_prompt(self):
+        self.submit('question')
+        self.finish(background=True)
+        for task in ('task', 'nested'):
+            self.payload['prompt_id'] = task + '-finished'
+            self.submit('  <task-notification><task-id>' + task + '</task-id></task-notification>')
+            self.assertIsNone(notifications.remembered_prompt(self.payload))
+        self.assertEqual(self.events, [('expect', 'one')])
+        self.finish(owner='one')
+        self.assertEqual(self.events, [('expect', 'one'), ('queue', 'one')])
+        self.assertEqual(len(self.sent), 1)
+
+    def test_unknown_task_notification_does_not_create_an_expectation(self):
+        self.submit('<task-notification><task-id>unknown</task-id></task-notification>')
+        self.assertFalse(self.events)
+        self.assertIsNone(notifications.remembered_prompt(self.payload))
+
+    def test_task_notification_mentioned_in_user_prompt_is_forwarded(self):
+        self.submit('Explain <task-notification>')
+        self.finish('Explain <task-notification>')
+        self.assertEqual(self.events, [('expect', 'one'), ('queue', 'one')])
+
     def test_identical_exchanges_in_different_prompts_are_both_forwarded(self):
         self.submit('question')
         self.finish()

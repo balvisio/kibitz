@@ -19,6 +19,7 @@ from kibitz_hook_common import (
     log,
     parse_directive,
     is_reviewer_originated,
+    is_task_notification,
     resolve_reviewer,
 )
 
@@ -32,6 +33,11 @@ def main():
 
     prompt = payload.get("prompt") if isinstance(payload, dict) else None
     if not isinstance(prompt, str) or not prompt.strip():
+        return 0
+
+    # Stop resolves task ownership from the transcript. Reserving the
+    # wakeup's new prompt ID here would leave an unrelated review outstanding.
+    if is_task_notification(prompt):
         return 0
 
     cleaned, directive = parse_directive(prompt)
