@@ -45,6 +45,8 @@ once after Claude and its reviewer are ready, including reviews queued behind ea
 needs no review; `/tee` waits for the review started when you submitted the prompt. Ctrl+C cancels the
 interrupted review without announcing successful completion. If Codex returns a queued review to its
 input box, tracking resumes when you submit it; discarding the draft does not block later alerts.
+Replacing a prompt or explicitly stopping all of its background tasks cancels its undispatched review.
+Other background work remains pending until it finishes; review reservations have no time limit.
 
 The integration uses Claude prompt IDs and the reviewer's turn IDs. Delivery failures are logged in
 `~/.claude/kibitz-hook.log`; the indicator also exposes `@agent-indicator-notification-error` on the

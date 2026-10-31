@@ -183,9 +183,8 @@ def send_queued_relay(pane_id, entries, anchor, note, force):
         log(f"relay: forward failed; dropped: {e}")
 
 
-def current_exchange(entries, include_prompt_id=False):
-    """Return (prompt_text, tasks): the human prompt that owns the turn being
-    stopped and the ids of every background task launched on its behalf.
+def exchange_history(entries):
+    """Resolve the current owner, task ownership, and abandoned exchanges.
 
     A turn is started by a typed prompt, a <task-notification> or a `! shell`
     command. A notification-started turn belongs to whichever prompt owns the
@@ -201,7 +200,26 @@ def current_exchange(entries, include_prompt_id=False):
     owner = None
     task_owner = {}
     tasks = {}
+    siblings = {}
+    replaced = set()
+    stop_calls = {}
+    stopped = set()
     for i, entry in enumerate(entries):
+        message = entry.get("message")
+        content = message.get("content", []) if isinstance(message, dict) else []
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if (entry.get("type") == "assistant" and block.get("type") == "tool_use"
+                    and block.get("name") == "TaskStop"):
+                task_id = (block.get("input") or {}).get("task_id")
+                if isinstance(task_id, str) and block.get("id"):
+                    stop_calls[block["id"]] = task_id
+            elif block.get("type") == "tool_result" and not block.get("is_error"):
+                task_id = stop_calls.get(block.get("tool_use_id"))
+                result = entry.get("toolUseResult")
+                if task_id and isinstance(result, dict) and result.get("task_id") == task_id:
+                    stopped.add(task_id)
         text = user_text(entry)
         if not text:
             if owner is not None:
@@ -215,12 +233,49 @@ def current_exchange(entries, include_prompt_id=False):
         elif is_command_text(text):
             owner = None
         elif not is_skippable_user_text(text):
+            parent = entry.get("parentUuid")
+            if parent and entry.get("uuid") and entry.get("promptId"):
+                previous = siblings.get(parent)
+                if (previous is not None and entries[previous].get("uuid") != entry["uuid"]
+                        and entries[previous].get("promptId") != entry["promptId"]):
+                    replaced.add(previous)
+                siblings[parent] = i
             owner = i
+    # A replacement without background work cannot produce a later reply.
+    # TaskStop produces no wakeup; retire its owner only when every task was
+    # explicitly stopped. Missing tasks or missing notifications prove nothing.
+    abandoned = {i for i in replaced if not tasks.get(i)}
+    abandoned.update(i for i, ids in tasks.items() if ids and ids <= stopped)
+    abandoned.discard(owner)
+    return owner, tasks, abandoned
+
+
+def current_exchange(entries, include_prompt_id=False, history=None):
+    """Return the current prompt text, its task IDs, and optionally its ID."""
+    owner, tasks, _abandoned = history if history is not None else exchange_history(entries)
     if owner is None:
         result = (None, set(), "")
     else:
         result = (user_text(entries[owner]), tasks.get(owner, set()), entries[owner].get("promptId", ""))
     return result if include_prompt_id else result[:2]
+
+
+def retire_abandoned(entries, history, payload, reviewer, current_prompt):
+    """Release only cached, undispatched exchanges with explicit abandonment."""
+    pending = {task.get("id") for task in payload.get("background_tasks") or []
+               if isinstance(task, dict) and isinstance(task.get("id"), str)}
+    _owner, tasks, abandoned = history
+    cancelled = []
+    for index in sorted(abandoned):
+        prompt_id = entries[index].get("promptId")
+        if not prompt_id or prompt_id == current_prompt or tasks.get(index, set()) & pending:
+            continue
+        old = dict(payload, prompt_id=prompt_id)
+        if remembered_prompt(old) is not None:
+            cancelled.append(prompt_id)
+    if cancelled and notify("cancel", payload, reviewer, prompt_ids=cancelled):
+        for prompt_id in cancelled:
+            forget_prompt(dict(payload, prompt_id=prompt_id))
 
 
 def main():
@@ -254,7 +309,8 @@ def main():
     if relay:
         send_queued_relay(pane_id, entries, *relay)
 
-    user_text_raw, launched, owner_prompt_id = current_exchange(entries, include_prompt_id=True)
+    history = exchange_history(entries)
+    user_text_raw, launched, owner_prompt_id = current_exchange(entries, include_prompt_id=True, history=history)
     notification_payload = dict(payload)
     # Fast replies can reach Stop before the transcript writer flushes the user
     # entry. Prompt-time metadata gives an exact fallback without guessing from
@@ -268,6 +324,7 @@ def main():
                     if isinstance(task, dict) and isinstance(task.get("id"), str)}
     if owner_prompt_id:
         notification_payload["prompt_id"] = owner_prompt_id
+    retire_abandoned(entries, history, payload, pane_id, owner_prompt_id)
     if not user_text_raw:
         notify("skip", notification_payload, pane_id)
         forget_prompt(notification_payload)

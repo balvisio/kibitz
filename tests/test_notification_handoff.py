@@ -24,7 +24,7 @@ class HandoffTest(unittest.TestCase):
         self.sent = []
         for module in (stop, prompt):
             for name, value in (
-                ('notify', lambda action, payload, *args: self.events.append((action, payload['prompt_id']))),
+                ('notify', lambda action, payload, *args, **kw: (self.events.extend((action, p) for p in kw.get('prompt_ids', [payload['prompt_id']])) or True)),
                 ('resolve_reviewer', lambda: ('%9', 'codex')),
                 ('current_pane_label', lambda: ''),
                 ('forward', lambda pane, message, **kw: self.sent.append(message)),
@@ -49,6 +49,95 @@ class HandoffTest(unittest.TestCase):
                   background_tasks=[{'id':'task'}] if background else [])
         with patch.object(sys, 'stdin', io.StringIO(json.dumps(data))):
             stop.main()
+
+    def abandoned_fixture(self, tasks=(), sibling=False, failed=False, unmatched=False):
+        self.submit('old question')
+        entries = [dict(type='user', promptId='one', uuid='old', parentUuid='anchor',
+                        message={'content': 'old question'})]
+        for task in tasks:
+            entries.append(dict(type='user', message={'content': []},
+                                toolUseResult={'backgroundTaskId': task}))
+        self.payload['prompt_id'] = 'two'
+        self.submit('new question')
+        entries.append(dict(type='user', promptId='two', uuid='new',
+                            parentUuid='anchor' if sibling else 'old', message={'content': 'new question'}))
+        for task in tasks:
+            entries.extend([
+                dict(type='assistant', message={'content': [dict(type='tool_use', id='stop-' + task,
+                    name='TaskStop', input={'task_id': task})]}),
+                dict(type='user', message={'content': [dict(type='tool_result',
+                    tool_use_id='missing' if unmatched else 'stop-' + task, is_error=failed)]},
+                    toolUseResult={'task_id': task}),
+            ])
+        return entries
+
+    def stop_entries(self, entries, pending=()):
+        transcript = self.root / 'transcript'
+        transcript.write_text(''.join(json.dumps(e) + '\n' for e in entries))
+        data = dict(self.payload, transcript_path=str(transcript), last_assistant_message='answer',
+                    background_tasks=[{'id': t} for t in pending])
+        with patch.object(sys, 'stdin', io.StringIO(json.dumps(data))):
+            stop.main()
+
+    def test_replaced_prompt_releases_only_its_expectation(self):
+        entries = self.abandoned_fixture(sibling=True)
+        self.stop_entries(entries)
+        self.assertEqual(self.events, [('expect', 'one'), ('expect', 'two'), ('cancel', 'one'), ('queue', 'two')])
+        self.assertIsNone(notifications.remembered_prompt(dict(self.payload, prompt_id='one')))
+        self.stop_entries(entries)
+        self.assertEqual(self.events.count(('cancel', 'one')), 1)
+
+    def test_new_prompt_alone_is_not_proof_of_abandonment(self):
+        self.stop_entries(self.abandoned_fixture())
+        self.assertNotIn(('cancel', 'one'), self.events)
+
+    def test_replaced_prompt_with_background_work_stays_pending(self):
+        entries = self.abandoned_fixture(tasks=('task',), sibling=True, failed=True)
+        self.stop_entries(entries)
+        self.assertNotIn(('cancel', 'one'), self.events)
+
+    def test_stopping_all_tasks_releases_their_original_prompt(self):
+        self.stop_entries(self.abandoned_fixture(tasks=('task', 'nested')))
+        self.assertIn(('cancel', 'one'), self.events)
+        self.assertIn(('queue', 'two'), self.events)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_failed_or_unmatched_task_stop_does_not_cancel(self):
+        for kwargs in ({'failed': True}, {'unmatched': True}):
+            self.events.clear()
+            self.payload['prompt_id'] = 'one'
+            self.stop_entries(self.abandoned_fixture(tasks=('task',), **kwargs))
+            self.assertNotIn(('cancel', 'one'), self.events)
+
+    def test_remaining_task_keeps_expectation_even_if_missing_from_payload(self):
+        entries = self.abandoned_fixture(tasks=('first', 'second'))
+        self.stop_entries(entries[:-2])
+        self.assertNotIn(('cancel', 'one'), self.events)
+
+    def test_task_reported_running_still_keeps_expectation(self):
+        entries = self.abandoned_fixture(tasks=('task',))
+        self.stop_entries(entries, pending=('task',))
+        self.assertNotIn(('cancel', 'one'), self.events)
+
+    def test_current_task_owner_is_not_cancelled(self):
+        entries = self.abandoned_fixture(tasks=('task',))
+        entries.append(dict(type='user', promptId='wakeup', message={'content':
+            '<task-notification><task-id>task</task-id></task-notification>'}))
+        self.payload['prompt_id'] = 'wakeup'
+        self.stop_entries(entries)
+        self.assertNotIn(('cancel', 'one'), self.events)
+        self.assertIn(('queue', 'one'), self.events)
+
+    def test_failed_cancellation_is_retried_on_next_stop(self):
+        entries = self.abandoned_fixture(sibling=True)
+        original = stop.notify
+        with patch.object(stop, 'notify', side_effect=lambda action, *args, **kw:
+                          False if action == 'cancel' else original(action, *args, **kw)):
+            self.stop_entries(entries)
+        self.assertEqual(notifications.remembered_prompt(dict(self.payload, prompt_id='one')), 'old question')
+        self.stop_entries(entries)
+        self.assertIn(('cancel', 'one'), self.events)
+
 
     def test_normal_turn_reserves_before_forwarding(self):
         self.submit('question')

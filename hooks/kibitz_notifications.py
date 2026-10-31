@@ -12,7 +12,7 @@ import subprocess
 from kibitz_hook_common import CACHE_DIR, log
 
 
-def notify(action, payload, reviewer=None, message=None):
+def notify(action, payload, reviewer=None, message=None, prompt_ids=None):
     session, prompt = payload.get("session_id"), payload.get("prompt_id")
     host = os.environ.get("TMUX_PANE", "")
     if not session or not prompt or not host or not os.environ.get("TMUX"):
@@ -30,11 +30,14 @@ def notify(action, payload, reviewer=None, message=None):
                     session_id=session, prompt_id=prompt)
         if reviewer:
             data["reviewer"] = reviewer
+        if prompt_ids is not None:
+            data["prompt_ids"] = prompt_ids
         if message is not None:
             data["hash"] = hashlib.sha256(message.strip().encode()).hexdigest()
         subprocess.run(["bash", str(script)], input=json.dumps(data), text=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                        check=True, timeout=10)
+        return True
     except (OSError, subprocess.SubprocessError) as error:
         log(f"notification handoff {action} failed: {type(error).__name__}")
 
