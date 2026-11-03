@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 
-from kibitz_hook_common import CACHE_DIR, log
+from kibitz_hook_common import CACHE_DIR, extract_text, is_skippable_user_text, is_task_notification, log
 
 
 def notify(action, payload, reviewer=None, message=None, prompt_ids=None):
@@ -50,6 +50,10 @@ def prompt_path(payload):
     return CACHE_DIR / ("prompt-" + key + ".json")
 
 
+def prompt_owner():
+    return [os.environ.get("TMUX", "").rsplit(",", 1)[0], os.environ.get("TMUX_PANE", "")]
+
+
 def remember_prompt(payload):
     path = prompt_path(payload)
     if path is None:
@@ -59,10 +63,82 @@ def remember_prompt(payload):
         temporary = path.with_suffix(f".{os.getpid()}.tmp")
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as stream:
-            json.dump({"prompt": payload.get("prompt", "")}, stream)
+            json.dump({"prompt": payload.get("prompt", ""),
+                       "session_id": payload.get("session_id"),
+                       "prompt_id": payload.get("prompt_id"),
+                       "owner": prompt_owner(),
+                       "checkpoint": transcript_checkpoint(payload)}, stream)
         temporary.replace(path)
     except OSError as error:
         log(f"prompt capture failed: {type(error).__name__}")
+
+
+def transcript_checkpoint(payload):
+    """Remember an existing record before an unrecorded submission starts."""
+    transcript = payload.get("transcript_path")
+    if not transcript:
+        return None
+    anchor = None
+    try:
+        with Path(transcript).open() as stream:
+            for line in stream:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    return None
+                if not isinstance(entry, dict):
+                    return None
+                if entry.get("promptId") == payload.get("prompt_id"):
+                    return None
+                if entry.get("uuid"):
+                    anchor = entry["uuid"]
+        if anchor:
+            return {"path": str(Path(transcript).resolve()), "anchor": anchor}
+    except OSError:
+        pass
+    return None
+
+
+def unrecorded_prompts(payload, entries):
+    """Find submissions superseded before they reached an intact transcript.
+
+    A later human prompt must have reached Stop and been written after the
+    saved checkpoint. Missing history or outstanding background work is not
+    evidence of abandonment.
+    """
+    if payload.get("background_tasks") != [] or not payload.get("transcript_path"):
+        return []
+    current = payload.get("prompt_id")
+    users = {e.get("promptId") for e in entries if e.get("type") == "user"}
+    positions = {e.get("uuid"): i for i, e in enumerate(entries) if e.get("uuid")}
+    current_index = next((i for i, e in enumerate(entries)
+                          if e.get("type") == "user" and e.get("promptId") == current), None)
+    if current_index is None:
+        return []
+    entry = entries[current_index]
+    text = extract_text((entry.get("message") or {}).get("content"))
+    if entry.get("isMeta") or is_skippable_user_text(text) or is_task_notification(text):
+        return []
+    transcript = str(Path(payload["transcript_path"]).resolve())
+    abandoned = []
+    for path in CACHE_DIR.glob("prompt-*.json"):
+        try:
+            record = json.loads(path.read_text())
+            if not isinstance(record, dict):
+                continue
+            checkpoint = record.get("checkpoint")
+            prompt = record.get("prompt_id")
+            if (record.get("session_id") != payload.get("session_id") or not prompt
+                    or record.get("owner") != prompt_owner()
+                    or prompt in users or not isinstance(checkpoint, dict)
+                    or checkpoint.get("path") != transcript):
+                continue
+            anchor_index = positions.get(checkpoint.get("anchor"))
+            if anchor_index is not None and anchor_index < current_index:
+                abandoned.append(prompt)
+        except (OSError, ValueError):
+            continue
+    return abandoned
 
 
 def remembered_prompt(payload):

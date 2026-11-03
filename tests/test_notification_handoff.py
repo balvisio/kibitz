@@ -87,6 +87,91 @@ class HandoffTest(unittest.TestCase):
         self.stop_entries(entries)
         self.assertEqual(self.events.count(('cancel', 'one')), 1)
 
+    def unrecorded_fixture(self, first='question', second='question /mute'):
+        transcript = self.root / 'transcript'
+        anchor = dict(type='assistant', uuid='anchor', message={'content': 'previous reply'})
+        transcript.write_text(json.dumps(anchor) + '\n')
+        self.payload['transcript_path'] = str(transcript)
+        self.submit(first)
+        self.payload['prompt_id'] = 'two'
+        self.submit(second)
+        return [anchor, dict(type='user', uuid='new', parentUuid='anchor', promptId='two',
+                             message={'content': second})]
+
+    def test_unrecorded_submission_is_cancelled_after_muted_replacement(self):
+        entries = self.unrecorded_fixture()
+        self.stop_entries(entries)
+        self.assertEqual(self.events, [('expect', 'one'), ('expect', 'two'), ('skip', 'two'),
+                                       ('cancel', 'one'), ('skip', 'two')])
+        self.assertIsNone(notifications.remembered_prompt(dict(self.payload, prompt_id='one')))
+        self.assertFalse(self.sent)
+
+    def test_unrecorded_cancellation_retries_even_after_current_cache_is_removed(self):
+        entries = self.unrecorded_fixture()
+        original = stop.notify
+        with patch.object(stop, 'notify', side_effect=lambda action, *args, **kw:
+                          False if action == 'cancel' else original(action, *args, **kw)):
+            self.stop_entries(entries)
+        self.assertIsNone(notifications.remembered_prompt(self.payload))
+        self.assertEqual(notifications.remembered_prompt(dict(self.payload, prompt_id='one')), 'question')
+        self.stop_entries(entries)
+        self.assertIn(('cancel', 'one'), self.events)
+
+    def test_unrecorded_cleanup_waits_for_background_work(self):
+        entries = self.unrecorded_fixture()
+        self.stop_entries(entries, pending=('task',))
+        self.assertNotIn(('cancel', 'one'), self.events)
+        self.stop_entries(entries)
+        self.assertIn(('cancel', 'one'), self.events)
+
+    def test_unrecorded_cleanup_requires_intact_checkpoint_and_written_current_prompt(self):
+        entries = self.unrecorded_fixture()
+        for snapshot in (entries[:1], entries[1:], list(reversed(entries))):
+            self.stop_entries(snapshot)
+            self.assertNotIn(('cancel', 'one'), self.events)
+
+    def test_recorded_prompt_is_not_abandoned_by_absence_cleanup(self):
+        entries = self.unrecorded_fixture()
+        entries.insert(1, dict(type='user', uuid='old', parentUuid='anchor', promptId='one',
+                               message={'content': 'question'}))
+        entries[2]['parentUuid'] = 'old'
+        self.stop_entries(entries)
+        self.assertNotIn(('cancel', 'one'), self.events)
+
+    def test_unrecorded_cleanup_is_scoped_to_session_and_transcript(self):
+        entries = self.unrecorded_fixture()
+        for change in ({'session_id': 'different'}, {'transcript_path': str(self.root/'different')}):
+            self.assertEqual(notifications.unrecorded_prompts(
+                dict(self.payload, background_tasks=[], **change), entries), [])
+        for change in ({'TMUX_PANE': '%another'}, {'TMUX': '/another/socket,123,0'}):
+            with patch.dict(os.environ, change):
+                self.assertEqual(notifications.unrecorded_prompts(
+                    dict(self.payload, background_tasks=[]), entries), [])
+
+    def test_unrecorded_cleanup_ignores_background_wakeup_and_missing_task_list(self):
+        entries = self.unrecorded_fixture()
+        self.assertEqual(notifications.unrecorded_prompts(self.payload, entries), [])
+        entries[-1]['message']['content'] = '<task-notification><task-id>task</task-id></task-notification>'
+        self.stop_entries(entries)
+        self.assertNotIn(('cancel', 'one'), self.events)
+
+    def test_already_written_submission_does_not_capture_an_absence_checkpoint(self):
+        entries = self.unrecorded_fixture()
+        transcript = Path(self.payload['transcript_path'])
+        transcript.write_text(''.join(json.dumps(e)+'\n' for e in entries))
+        self.submit('question /mute')
+        data = json.loads(notifications.prompt_path(self.payload).read_text())
+        self.assertIsNone(data['checkpoint'])
+
+    def test_incomplete_transcript_does_not_capture_an_absence_checkpoint(self):
+        entries = self.unrecorded_fixture()
+        transcript = Path(self.payload['transcript_path'])
+        transcript.write_text(json.dumps(entries[0])+'\n{"type":')
+        self.payload['prompt_id'] = 'three'
+        self.submit('question')
+        data = json.loads(notifications.prompt_path(self.payload).read_text())
+        self.assertIsNone(data['checkpoint'])
+
     def test_new_prompt_alone_is_not_proof_of_abandonment(self):
         self.stop_entries(self.abandoned_fixture())
         self.assertNotIn(('cancel', 'one'), self.events)

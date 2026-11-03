@@ -46,6 +46,8 @@ needs no review; `/tee` waits for the review started when you submitted the prom
 interrupted review without announcing successful completion. If Codex returns a queued review to its
 input box, tracking resumes when you submit it; discarding the draft does not block later alerts.
 Replacing a prompt or explicitly stopping all of its background tasks cancels its undispatched review.
+Submissions abandoned before they enter the transcript are cleared after a later prompt finishes,
+provided the transcript checkpoint is intact and no background tasks remain.
 Other background work remains pending until it finishes; review reservations have no time limit.
 
 The integration uses Claude prompt IDs and the reviewer's turn IDs. Delivery failures are logged in

@@ -34,7 +34,7 @@ import json
 import re
 import sys
 
-from kibitz_notifications import notify, remembered_prompt, forget_prompt
+from kibitz_notifications import notify, remembered_prompt, forget_prompt, unrecorded_prompts
 from pathlib import Path
 
 from kibitz_hook_common import (
@@ -265,7 +265,7 @@ def retire_abandoned(entries, history, payload, reviewer, current_prompt):
     pending = {task.get("id") for task in payload.get("background_tasks") or []
                if isinstance(task, dict) and isinstance(task.get("id"), str)}
     _owner, tasks, abandoned = history
-    cancelled = []
+    cancelled = unrecorded_prompts(payload, entries)
     for index in sorted(abandoned):
         prompt_id = entries[index].get("promptId")
         if not prompt_id or prompt_id == current_prompt or tasks.get(index, set()) & pending:
