@@ -48,6 +48,8 @@ input box, tracking resumes when you submit it; discarding the draft does not bl
 Replacing a prompt or explicitly stopping all of its background tasks cancels its undispatched review.
 Submissions abandoned before they enter the transcript are cleared after a later prompt finishes,
 provided the transcript checkpoint is intact and no background tasks remain.
+If Claude delivers a task completion inside another turn, that turn keeps its review.
+The older undispatched review is cleared only after all of its tasks explicitly finish or stop.
 Other background work remains pending until it finishes; review reservations have no time limit.
 
 The integration uses Claude prompt IDs and the reviewer's turn IDs. Delivery failures are logged in

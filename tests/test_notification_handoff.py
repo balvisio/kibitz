@@ -14,6 +14,14 @@ import kibitz_hook_stop as stop
 import kibitz_hook_user_prompt_submit as prompt
 
 
+def task_attachment(task, status='completed'):
+    return dict(type='attachment', attachment=dict(
+        type='queued_command', commandMode='task-notification',
+        origin={'kind': 'task-notification', 'producer': 'session-task'},
+        prompt=f'<task-notification><task-id>{task}</task-id>'
+               f'<status>{status}</status><summary>fixture</summary></task-notification>'))
+
+
 class HandoffTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -222,6 +230,101 @@ class HandoffTest(unittest.TestCase):
         self.assertEqual(notifications.remembered_prompt(dict(self.payload, prompt_id='one')), 'old question')
         self.stop_entries(entries)
         self.assertIn(('cancel', 'one'), self.events)
+
+    def attached_fixture(self, tasks=('task',)):
+        self.submit('old question')
+        entries = [dict(type='user', promptId='one', message={'content': 'old question'})]
+        for task in tasks:
+            entries.append(dict(type='user', message={'content': []},
+                                toolUseResult={'backgroundTaskId': task}))
+        self.payload['prompt_id'] = 'two'
+        self.submit('new question')
+        entries.append(dict(type='user', promptId='two', message={'content': 'new question'}))
+        entries.append(task_attachment(tasks[-1]))
+        return entries
+
+    def test_attached_completion_retires_original_expectation_and_keeps_current_review(self):
+        entries = self.attached_fixture()
+        self.stop_entries(entries)
+        self.assertEqual(self.events, [('expect', 'one'), ('expect', 'two'),
+                                       ('cancel', 'one'), ('queue', 'two')])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn('USER:\nnew question', self.sent[0])
+        self.assertIsNone(notifications.remembered_prompt(dict(self.payload, prompt_id='one')))
+        self.stop_entries(entries)
+        self.assertEqual(self.events.count(('cancel', 'one')), 1)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_attached_completion_waits_for_every_original_task(self):
+        entries = self.attached_fixture(tasks=('first', 'second'))
+        self.stop_entries(entries)
+        self.assertNotIn(('cancel', 'one'), self.events)
+        entries.append(task_attachment('first', 'failed'))
+        self.stop_entries(entries)
+        self.assertIn(('cancel', 'one'), self.events)
+
+    def test_mixed_standalone_and_attached_completions_release_original(self):
+        entries = self.attached_fixture(tasks=('first', 'second'))
+        entries.insert(-2, dict(type='user', message={'content':
+            task_attachment('first')['attachment']['prompt']}))
+        self.stop_entries(entries)
+        self.assertIn(('cancel', 'one'), self.events)
+        self.assertIn(('queue', 'two'), self.events)
+
+    def test_attached_completion_does_not_override_running_task_payload(self):
+        entries = self.attached_fixture()
+        self.stop_entries(entries, pending=('task',))
+        self.assertNotIn(('cancel', 'one'), self.events)
+        self.stop_entries(entries)
+        self.assertIn(('cancel', 'one'), self.events)
+
+    def test_attached_completion_of_current_owner_keeps_its_review(self):
+        self.submit('question')
+        entries = [dict(type='user', promptId='one', message={'content': 'question'}),
+                   dict(type='user', message={'content': []}, toolUseResult={'backgroundTaskId': 'task'}),
+                   task_attachment('task')]
+        self.stop_entries(entries)
+        self.assertEqual(self.events, [('expect', 'one'), ('queue', 'one')])
+
+    def test_unknown_progress_or_untrusted_attachments_do_not_retire_reviews(self):
+        entries = self.attached_fixture()
+        missing_origin = task_attachment('task')
+        missing_origin['attachment'].pop('origin')
+        quoted = dict(type='user', message={'content': 'Example: ' + task_attachment('task')['attachment']['prompt']})
+        queued_only = dict(task_attachment('task'), type='queue-operation')
+        wrong_mode = task_attachment('task')
+        wrong_mode['attachment']['commandMode'] = 'prompt'
+        malformed = task_attachment('task')
+        malformed['attachment']['prompt'] = None
+        for attachment in (task_attachment('unknown'), task_attachment('task', 'running'),
+                           task_attachment('task', ''), missing_origin, quoted, queued_only,
+                           wrong_mode, malformed):
+            with self.subTest(attachment=attachment):
+                self.stop_entries(entries[:-1] + [attachment])
+                self.assertNotIn(('cancel', 'one'), self.events)
+
+    def test_attached_completion_keeps_nested_work_pending(self):
+        entries = self.attached_fixture()
+        # An earlier completion resumed the old prompt and launched more work.
+        entries[-2:-2] = [dict(type='user', message={'content':
+            task_attachment('task')['attachment']['prompt']}),
+            dict(type='user', message={'content': []}, toolUseResult={'backgroundTaskId': 'nested'})]
+        self.stop_entries(entries)
+        self.assertNotIn(('cancel', 'one'), self.events)
+        entries.append(task_attachment('nested', 'killed'))
+        self.stop_entries(entries)
+        self.assertIn(('cancel', 'one'), self.events)
+
+    def test_attached_completion_cancellation_retries_without_replaying_reply(self):
+        entries = self.attached_fixture()
+        original = stop.notify
+        with patch.object(stop, 'notify', side_effect=lambda action, *args, **kw:
+                          False if action == 'cancel' else original(action, *args, **kw)):
+            self.stop_entries(entries)
+        self.assertIsNotNone(notifications.remembered_prompt(dict(self.payload, prompt_id='one')))
+        self.stop_entries(entries)
+        self.assertIn(('cancel', 'one'), self.events)
+        self.assertEqual(len(self.sent), 1)
 
 
     def test_normal_turn_reserves_before_forwarding(self):

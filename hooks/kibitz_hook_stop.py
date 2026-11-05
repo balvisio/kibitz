@@ -92,6 +92,32 @@ def launched_task_ids(entry):
     return {result[key] for key in _TASK_ID_KEYS if isinstance(result.get(key), str)}
 
 
+def terminal_task_ids(text):
+    """Require an explicit terminal status, never a progress notification."""
+    if not isinstance(text, str) or not is_task_notification(text):
+        return set()
+    # Summary text is arbitrary tool output, not notification metadata.
+    header = text.split("<summary>", 1)[0]
+    ids = re.findall(r"<task-id>([^<]+)</task-id>", header)
+    statuses = re.findall(r"<status>([^<]+)</status>", header)
+    if len(ids) == 1 and statuses in (["completed"], ["failed"], ["killed"]):
+        return set(ids)
+    return set()
+
+
+def attached_task_ids(entry):
+    """Completions delivered to an ongoing turn, rather than starting a turn."""
+    attachment = entry.get("attachment")
+    if entry.get("type") != "attachment" or not isinstance(attachment, dict):
+        return set()
+    origin = attachment.get("origin")
+    if (attachment.get("type") != "queued_command"
+            or attachment.get("commandMode") != "task-notification"
+            or not isinstance(origin, dict) or origin.get("kind") != "task-notification"):
+        return set()
+    return terminal_task_ids(attachment.get("prompt"))
+
+
 RELAY_LINE = "[kibitz] relay queued - goes to the reviewer when this turn ends"
 RELAY_LINE_FORCE = "[kibitz] relay queued (force) - goes to the reviewer when this turn ends, even mid-task"
 # The launcher's instruction to the host agent; Claude Code records stderr
@@ -196,7 +222,9 @@ def exchange_history(entries):
     inside an ongoing turn, so they leave ownership untouched. User entries
     are flushed long before the Stop hook fires, so
     reading the transcript here is safe — unlike the final assistant text
-    block, which is often still buffered at hook time."""
+    block, which is often still buffered at hook time. Task completions attached
+    to an ongoing turn keep that turn's owner; their earlier expectations can
+    be retired once all of that owner's tasks have explicitly ended."""
     owner = None
     task_owner = {}
     tasks = {}
@@ -204,7 +232,15 @@ def exchange_history(entries):
     replaced = set()
     stop_calls = {}
     stopped = set()
+    completed = set()
+    absorbed = set()
     for i, entry in enumerate(entries):
+        for task_id in attached_task_ids(entry):
+            if task_id not in task_owner:
+                continue
+            completed.add(task_id)
+            if owner is not None and owner != task_owner[task_id]:
+                absorbed.add(task_owner[task_id])
         message = entry.get("message")
         content = message.get("content", []) if isinstance(message, dict) else []
         for block in content if isinstance(content, list) else []:
@@ -227,6 +263,7 @@ def exchange_history(entries):
                     task_owner[task_id] = owner
                     tasks.setdefault(owner, set()).add(task_id)
         elif is_task_notification(text):
+            completed.update(terminal_task_ids(text) & task_owner.keys())
             ids = re.findall(r"<task-id>([^<]+)</task-id>", text)
             known = [task_owner[task_id] for task_id in ids if task_id in task_owner]
             owner = known[0] if known else None
@@ -246,6 +283,10 @@ def exchange_history(entries):
     # explicitly stopped. Missing tasks or missing notifications prove nothing.
     abandoned = {i for i in replaced if not tasks.get(i)}
     abandoned.update(i for i, ids in tasks.items() if ids and ids <= stopped)
+    # The receiving turn carries the combined reply. Do not wait forever for
+    # a standalone wakeup that Claude has already delivered as an attachment.
+    # Other tasks (including nested launches) still need terminal evidence.
+    abandoned.update(i for i in absorbed if tasks[i] <= completed | stopped)
     abandoned.discard(owner)
     return owner, tasks, abandoned
 
