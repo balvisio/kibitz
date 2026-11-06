@@ -34,7 +34,9 @@ import json
 import re
 import sys
 
-from kibitz_notifications import notify, remembered_prompt, forget_prompt, unrecorded_prompts
+from kibitz_notifications import (
+    notify, remembered_prompt, forget_prompt, unrecorded_prompts, resolved_queued_prompts,
+)
 from pathlib import Path
 
 from kibitz_hook_common import (
@@ -92,7 +94,7 @@ def launched_task_ids(entry):
     return {result[key] for key in _TASK_ID_KEYS if isinstance(result.get(key), str)}
 
 
-def terminal_task_ids(text):
+def terminal_task_ids(text, monitors=()):
     """Require an explicit terminal status, never a progress notification."""
     if not isinstance(text, str) or not is_task_notification(text):
         return set()
@@ -102,10 +104,20 @@ def terminal_task_ids(text):
     statuses = re.findall(r"<status>([^<]+)</status>", header)
     if len(ids) == 1 and statuses in (["completed"], ["failed"], ["killed"]):
         return set(ids)
+    # Monitor's own expiration notice has no <status>. Only accept its complete
+    # lifecycle message for a task whose launch was a Monitor tool call. Normal
+    # monitor output (including a quoted expiration) is not terminal evidence.
+    if len(ids) == 1 and not statuses and ids[0] in monitors:
+        events = re.findall(r"<event>(.*?)</event>", text, re.S)
+        if len(events) == 1 and re.fullmatch(
+                r"\[Monitor expired after \d+[smh] with (?:no events|\d+ events?) delivered\. "
+                r"Re-arm it if you still need the watch"
+                r"(?: — and widen the filter if silence was unexpected)?\.\]", events[0]):
+            return set(ids)
     return set()
 
 
-def attached_task_ids(entry):
+def attached_task_ids(entry, monitors=()):
     """Completions delivered to an ongoing turn, rather than starting a turn."""
     attachment = entry.get("attachment")
     if entry.get("type") != "attachment" or not isinstance(attachment, dict):
@@ -115,7 +127,7 @@ def attached_task_ids(entry):
             or attachment.get("commandMode") != "task-notification"
             or not isinstance(origin, dict) or origin.get("kind") != "task-notification"):
         return set()
-    return terminal_task_ids(attachment.get("prompt"))
+    return terminal_task_ids(attachment.get("prompt"), monitors)
 
 
 RELAY_LINE = "[kibitz] relay queued - goes to the reviewer when this turn ends"
@@ -231,31 +243,32 @@ def exchange_history(entries):
     siblings = {}
     replaced = set()
     stop_calls = {}
-    stopped = set()
-    completed = set()
-    absorbed = set()
+    ended = set()
+    monitor_calls = set()
+    monitors = set()
+    prompt_owners = {}
     for i, entry in enumerate(entries):
-        for task_id in attached_task_ids(entry):
-            if task_id not in task_owner:
-                continue
-            completed.add(task_id)
-            if owner is not None and owner != task_owner[task_id]:
-                absorbed.add(task_owner[task_id])
+        ended.update(attached_task_ids(entry, monitors) & task_owner.keys())
         message = entry.get("message")
         content = message.get("content", []) if isinstance(message, dict) else []
         for block in content if isinstance(content, list) else []:
             if not isinstance(block, dict):
                 continue
             if (entry.get("type") == "assistant" and block.get("type") == "tool_use"
+                    and block.get("name") == "Monitor" and block.get("id")):
+                monitor_calls.add(block["id"])
+            if (entry.get("type") == "assistant" and block.get("type") == "tool_use"
                     and block.get("name") == "TaskStop"):
                 task_id = (block.get("input") or {}).get("task_id")
                 if isinstance(task_id, str) and block.get("id"):
                     stop_calls[block["id"]] = task_id
             elif block.get("type") == "tool_result" and not block.get("is_error"):
+                if block.get("tool_use_id") in monitor_calls:
+                    monitors.update(launched_task_ids(entry))
                 task_id = stop_calls.get(block.get("tool_use_id"))
                 result = entry.get("toolUseResult")
                 if task_id and isinstance(result, dict) and result.get("task_id") == task_id:
-                    stopped.add(task_id)
+                    ended.add(task_id)
         text = user_text(entry)
         if not text:
             if owner is not None:
@@ -263,7 +276,9 @@ def exchange_history(entries):
                     task_owner[task_id] = owner
                     tasks.setdefault(owner, set()).add(task_id)
         elif is_task_notification(text):
-            completed.update(terminal_task_ids(text) & task_owner.keys())
+            origin = entry.get("origin") or {}
+            native_monitors = monitors if origin.get("kind") == "task-notification" else ()
+            ended.update(terminal_task_ids(text, native_monitors) & task_owner.keys())
             ids = re.findall(r"<task-id>([^<]+)</task-id>", text)
             known = [task_owner[task_id] for task_id in ids if task_id in task_owner]
             owner = known[0] if known else None
@@ -277,16 +292,16 @@ def exchange_history(entries):
                         and entries[previous].get("promptId") != entry["promptId"]):
                     replaced.add(previous)
                 siblings[parent] = i
-            owner = i
+            # A compact summary can repeat the original prompt ID. Keep one
+            # owner for its pre- and post-compaction tasks and original text.
+            prompt = entry.get("promptId")
+            owner = prompt_owners.setdefault(prompt, i) if prompt else i
     # A replacement without background work cannot produce a later reply.
-    # TaskStop produces no wakeup; retire its owner only when every task was
-    # explicitly stopped. Missing tasks or missing notifications prove nothing.
+    # Completion notices may be batched into another turn, and TaskStop emits
+    # no wakeup. Retire an earlier owner only after *every* task explicitly
+    # completed, failed, expired, or stopped. A missing task proves nothing.
     abandoned = {i for i in replaced if not tasks.get(i)}
-    abandoned.update(i for i, ids in tasks.items() if ids and ids <= stopped)
-    # The receiving turn carries the combined reply. Do not wait forever for
-    # a standalone wakeup that Claude has already delivered as an attachment.
-    # Other tasks (including nested launches) still need terminal evidence.
-    abandoned.update(i for i in absorbed if tasks[i] <= completed | stopped)
+    abandoned.update(i for i, ids in tasks.items() if ids and ids <= ended)
     abandoned.discard(owner)
     return owner, tasks, abandoned
 
@@ -306,7 +321,7 @@ def retire_abandoned(entries, history, payload, reviewer, current_prompt):
     pending = {task.get("id") for task in payload.get("background_tasks") or []
                if isinstance(task, dict) and isinstance(task.get("id"), str)}
     _owner, tasks, abandoned = history
-    cancelled = unrecorded_prompts(payload, entries)
+    cancelled = unrecorded_prompts(payload, entries) + resolved_queued_prompts(payload, entries)
     for index in sorted(abandoned):
         prompt_id = entries[index].get("promptId")
         if not prompt_id or prompt_id == current_prompt or tasks.get(index, set()) & pending:
@@ -314,6 +329,7 @@ def retire_abandoned(entries, history, payload, reviewer, current_prompt):
         old = dict(payload, prompt_id=prompt_id)
         if remembered_prompt(old) is not None:
             cancelled.append(prompt_id)
+    cancelled = list(dict.fromkeys(cancelled))
     if cancelled and notify("cancel", payload, reviewer, prompt_ids=cancelled):
         for prompt_id in cancelled:
             forget_prompt(dict(payload, prompt_id=prompt_id))

@@ -326,6 +326,231 @@ class HandoffTest(unittest.TestCase):
         self.assertIn(('cancel', 'one'), self.events)
         self.assertEqual(len(self.sent), 1)
 
+    def monitor_fixture(self, event, attached=False):
+        self.submit('watch the task')
+        entries = [dict(type='user', promptId='one', message={'content':'watch the task'}),
+                   dict(type='assistant', message={'content':[dict(type='tool_use', id='launch', name='Monitor')]}),
+                   dict(type='user', message={'content':[dict(type='tool_result', tool_use_id='launch')]},
+                        toolUseResult={'taskId':'monitor'})]
+        self.payload['prompt_id'] = 'two'
+        self.submit('next question')
+        notice = ('<task-notification><task-id>monitor</task-id>'
+                  '<summary>Monitor event: fixture</summary><event>'+event+'</event></task-notification>')
+        if not attached:
+            entries.append(dict(type='user', promptId='wake', origin={'kind':'task-notification'},
+                                message={'content':notice}))
+        entries.append(dict(type='user', promptId='two', message={'content':'next question'}))
+        if attached:
+            entry = task_attachment('monitor')
+            entry['attachment']['prompt'] = notice
+            entries.append(entry)
+        return entries
+
+    def test_monitor_expiration_is_terminal_in_both_delivery_formats(self):
+        for attached in (False, True):
+            for count, suffix in [('3 events', ''), ('1 event', ''),
+                                  ('no events', ' — and widen the filter if silence was unexpected')]:
+                with self.subTest(attached=attached, count=count):
+                    self.payload['prompt_id'] = 'one'
+                    self.events.clear()
+                    event = f'[Monitor expired after 30m with {count} delivered. Re-arm it if you still need the watch{suffix}.]'
+                    self.stop_entries(self.monitor_fixture(event, attached))
+                    self.assertIn(('cancel','one'), self.events)
+
+    def test_monitor_progress_quotes_and_unverified_launch_do_not_expire_review(self):
+        expired = '[Monitor expired after 30m with 1 event delivered. Re-arm it if you still need the watch.]'
+        for event, name, origin in [('still watching', 'Monitor', 'task-notification'),
+                                     ('output: '+expired, 'Monitor', 'task-notification'),
+                                     (expired, 'Bash', 'task-notification'),
+                                     (expired, 'Monitor', 'human')]:
+            with self.subTest(event=event, name=name, origin=origin):
+                self.payload['prompt_id'] = 'one'
+                self.events.clear()
+                entries = self.monitor_fixture(event)
+                entries[1]['message']['content'][0]['name'] = name
+                entries[-2]['origin']['kind'] = origin
+                self.stop_entries(entries)
+                self.assertNotIn(('cancel','one'), self.events)
+
+    def test_expired_monitor_rearm_keeps_new_work_pending(self):
+        event = '[Monitor expired after 30m with no events delivered. Re-arm it if you still need the watch — and widen the filter if silence was unexpected.]'
+        entries = self.monitor_fixture(event)
+        entries.insert(-1, dict(type='user', message={'content':[]}, toolUseResult={'taskId':'rearmed'}))
+        self.stop_entries(entries)
+        self.assertNotIn(('cancel','one'), self.events)
+        entries.append(task_attachment('rearmed'))
+        self.stop_entries(entries)
+        self.assertIn(('cancel','one'), self.events)
+
+    def test_mixed_completed_and_stopped_tasks_retire_without_an_attachment(self):
+        entries = self.abandoned_fixture(tasks=('finished','stopped'))
+        # Remove the first TaskStop; that task ended normally before the next prompt.
+        del entries[4:6]
+        entries.insert(3, dict(type='user', promptId='wake', message={'content':
+            task_attachment('finished')['attachment']['prompt']}))
+        self.stop_entries(entries)
+        self.assertIn(('cancel','one'), self.events)
+        self.assertIn(('queue','two'), self.events)
+
+    def test_batched_standalone_completions_retire_earlier_owner(self):
+        self.submit('first task')
+        entries = [dict(type='user', promptId='one', message={'content':'first task'}),
+                   dict(type='user', message={'content':[]}, toolUseResult={'taskId':'first'})]
+        self.payload['prompt_id'] = 'two'
+        self.submit('second task')
+        entries += [dict(type='user', promptId='two', message={'content':'second task'}),
+                    dict(type='user', message={'content':[]}, toolUseResult={'taskId':'second'})]
+        for task in ('first','second'):
+            entries.append(dict(type='user', promptId='wake-'+task, message={'content':
+                task_attachment(task)['attachment']['prompt']}))
+        self.payload['prompt_id'] = 'wake-second'
+        self.stop_entries(entries)
+        self.assertIn(('cancel','one'), self.events)
+        self.assertNotIn(('cancel','two'), self.events)
+        self.assertIn(('queue','two'), self.events)
+
+    def test_compaction_keeps_one_owner_and_original_prompt_for_all_tasks(self):
+        self.submit('original request')
+        entries = [dict(type='user', promptId='one', message={'content':'original request'}),
+                   dict(type='user', message={'content':[]}, toolUseResult={'taskId':'first'}),
+                   dict(type='user', promptId='one', isCompactSummary=True, message={'content':'summary'}),
+                   dict(type='user', message={'content':[]}, toolUseResult={'taskId':'second'}),
+                   dict(type='user', promptId='wake', message={'content':
+                        task_attachment('second')['attachment']['prompt']})]
+        owner, tasks, _ = stop.exchange_history(entries)
+        self.assertEqual(owner, 0)
+        self.assertEqual(tasks[owner], {'first','second'})
+        self.payload['prompt_id'] = 'wake'
+        self.stop_entries(entries, pending=('first',))
+        self.assertFalse(self.sent)
+        entries.append(task_attachment('first'))
+        self.stop_entries(entries)
+        self.assertIn('USER:\noriginal request', self.sent[0])
+
+    def queued_fixture(self, attached=False, text='queued question'):
+        entries = [dict(type='user', uuid='root', promptId='root', message={'content':'original work'}),
+                   dict(type='user', uuid='launch', message={'content':[]}, toolUseResult={'taskId':'task'}),
+                   dict(type='user', uuid='anchor', promptId='one', origin={'kind':'task-notification'},
+                        message={'content':task_attachment('task')['attachment']['prompt']})]
+        transcript = self.root/'transcript'
+        transcript.write_text(''.join(json.dumps(e)+'\n' for e in entries))
+        self.payload.update(prompt_id='one', transcript_path=str(transcript))
+        self.submit(text)
+        entries.append(dict(type='queue-operation', operation='enqueue', content=text))
+        if attached:
+            entries.extend([
+                dict(type='queue-operation', operation='remove', reason='absorbed_mid_turn',
+                     commandUuid='source', deliveryId='receipt', content=text),
+                dict(type='attachment', attachment=dict(type='queued_command', commandMode='prompt',
+                     origin={'kind':'human'}, source_uuid='source', delivery_id='receipt', prompt=text)),
+            ])
+        else:
+            entries.append(dict(type='user', uuid='delivered', promptId='delivered',
+                                origin={'kind':'human'}, message={'content':text}))
+            self.payload['prompt_id'] = 'delivered'
+        return entries
+
+    def test_queued_prompt_captures_checkpoint_despite_reused_wakeup_id(self):
+        self.queued_fixture()
+        record = json.loads(notifications.prompt_path(dict(self.payload,prompt_id='one')).read_text())
+        self.assertEqual(record['checkpoint']['anchor'], 'anchor')
+
+    def test_queued_prompt_new_id_retires_old_reservation_and_reviews_actual_turn(self):
+        entries = self.queued_fixture()
+        self.stop_entries(entries)
+        self.assertEqual(self.events, [('expect','one'), ('cancel','one'), ('queue','delivered')])
+        self.assertIn('USER:\nqueued question', self.sent[0])
+        self.stop_entries(entries)
+        self.assertEqual(self.events.count(('cancel','one')), 1)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_queued_human_attachment_clears_alias_at_receiving_stop(self):
+        entries = self.queued_fixture(attached=True)
+        self.stop_entries(entries)
+        self.assertIn(('cancel','one'), self.events)
+        self.assertIn(('queue','root'), self.events)
+
+    def test_queued_alias_waits_for_work_and_retries_failed_cancellation(self):
+        entries = self.queued_fixture(attached=True)
+        self.stop_entries(entries, pending=('task',))
+        self.assertNotIn(('cancel','one'), self.events)
+        original = stop.notify
+        with patch.object(stop,'notify',side_effect=lambda action,*a,**kw:
+                          False if action=='cancel' else original(action,*a,**kw)):
+            self.stop_entries(entries)
+        self.assertIsNotNone(notifications.remembered_prompt(dict(self.payload,prompt_id='one')))
+        self.stop_entries(entries)
+        self.assertEqual(self.events.count(('cancel','one')), 1)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_queued_alias_requires_exact_delivery_and_intact_scope(self):
+        entries = self.queued_fixture(attached=True)
+        for change in ('queue-only','receipt-only','attachment-only','wrong-receipt','wrong-origin',
+                       'wrong-text','missing-anchor','stale-stop','unknown-work','other-pane',
+                       'other-session','other-transcript'):
+            with self.subTest(change=change):
+                snapshot = json.loads(json.dumps(entries))
+                payload = dict(self.payload, background_tasks=[])
+                env = {}
+                if change=='queue-only': snapshot=snapshot[:-2]
+                if change=='receipt-only': snapshot=snapshot[:-1]
+                if change=='attachment-only': del snapshot[-2]
+                if change=='wrong-receipt': snapshot[-1]['attachment']['delivery_id']='other'
+                if change=='wrong-origin': snapshot[-1]['attachment']['origin']['kind']='task-notification'
+                if change=='wrong-text': snapshot[-1]['attachment']['prompt']='different'
+                if change=='missing-anchor': del snapshot[2]
+                if change=='stale-stop': payload['prompt_id']='previous'
+                if change=='unknown-work': payload.pop('background_tasks')
+                if change=='other-pane': env['TMUX_PANE']='%other'
+                if change=='other-session': payload['session_id']='other'
+                if change=='other-transcript': payload['transcript_path']=str(self.root/'other')
+                with patch.dict(os.environ,env):
+                    self.assertEqual(notifications.resolved_queued_prompts(payload,snapshot), [])
+
+    def test_queued_only_submission_is_not_cancelled_by_later_human_stop(self):
+        entries = self.queued_fixture(attached=True)[:-2]
+        entries.append(dict(type='user', promptId='later', uuid='later',
+                            message={'content':'unrelated question'}))
+        self.payload['prompt_id']='later'
+        self.stop_entries(entries)
+        self.assertNotIn(('cancel','one'), self.events)
+
+    def test_identical_queued_prompts_require_distinct_deliveries(self):
+        entries = self.queued_fixture()
+        self.payload['prompt_id']='second-alias'
+        self.submit('queued question')
+        self.payload['prompt_id']='delivered'
+        self.stop_entries(entries)
+        self.assertNotIn(('cancel','one'), self.events)
+        self.assertNotIn(('cancel','second-alias'), self.events)
+        entries.append(dict(entries[-1], uuid='another', promptId='another'))
+        self.payload['prompt_id']='another'
+        self.stop_entries(entries)
+        self.assertIn(('cancel','one'), self.events)
+        self.assertIn(('cancel','second-alias'), self.events)
+
+    def test_repeated_attachment_receipt_cannot_clear_two_queued_prompts(self):
+        entries = self.queued_fixture(attached=True)
+        self.payload['prompt_id']='second-alias'
+        self.submit('queued question')
+        self.payload['prompt_id']='one'
+        entries.append(json.loads(json.dumps(entries[-1])))
+        self.stop_entries(entries)
+        self.assertNotIn(('cancel','one'), self.events)
+        self.assertNotIn(('cancel','second-alias'), self.events)
+
+    def test_ambiguous_old_checkpoint_keeps_identical_queued_prompt_pending(self):
+        entries = self.queued_fixture()
+        self.payload['prompt_id']='second-alias'
+        self.submit('queued question')
+        path=notifications.prompt_path(self.payload)
+        record=json.loads(path.read_text());record['checkpoint']=None
+        path.write_text(json.dumps(record))
+        self.payload['prompt_id']='delivered'
+        self.stop_entries(entries)
+        self.assertNotIn(('cancel','one'), self.events)
+        self.assertNotIn(('cancel','second-alias'), self.events)
+
 
     def test_normal_turn_reserves_before_forwarding(self):
         self.submit('question')
