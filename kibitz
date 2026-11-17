@@ -30,6 +30,8 @@ KIBITZ_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/kibitz"
 # Reviewer role artifacts. The launcher wraps the agent binary so we can feed
 # the role prompt in at exec time without quoting issues crossing tmux split-window.
 LAUNCHER_NAME="kibitz_reviewer_launch"
+SESSION_HELPER_NAME="kibitz_session.py"
+CODEX_START_HELPER_NAME="kibitz_codex_start.py"
 CLAUDE_AGENTS_DIR="$HOME/.claude/agents"
 CLAUDE_AGENT_FILE="kibitz-reviewer.md"
 CODEX_ROLE_DIR="$HOME/.codex/systemprompts"
@@ -101,9 +103,10 @@ walk_ppid_for_agent() {
   return 1
 }
 
-# CLAUDECODE=1 is set per-tool-call by Claude Code; codex sets no env marker.
+# Agent tool calls identify themselves with CLAUDECODE or CODEX_THREAD_ID.
 detect_host_agent() {
   [[ "${CLAUDECODE:-}" == "1" ]] && { echo claude; return 0; }
+  [[ -n "${CODEX_THREAD_ID:-}" ]] && { echo codex; return 0; }
   walk_ppid_for_agent
 }
 
@@ -426,7 +429,7 @@ cmd_install() {
   command -v python3 >/dev/null 2>&1 \
     || die "python3 is required on PATH (needed by the Stop hook and settings merge)"
 
-  local src_dir kibitz_src bridge_src hook_json_src codex_hook_json_src launcher_src claude_agent_src codex_role_src
+  local src_dir kibitz_src bridge_src hook_json_src codex_hook_json_src launcher_src session_helper_src codex_start_src claude_agent_src codex_role_src
   if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
     src_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
     kibitz_src="${BASH_SOURCE[0]}"
@@ -444,6 +447,8 @@ cmd_install() {
   hook_json_src="$src_dir/hooks/$HOOK_JSON_NAME"
   codex_hook_json_src="$src_dir/hooks/$CODEX_HOOK_JSON_NAME"
   launcher_src="$src_dir/scripts/$LAUNCHER_NAME"
+  session_helper_src="$src_dir/scripts/$SESSION_HELPER_NAME"
+  codex_start_src="$src_dir/scripts/$CODEX_START_HELPER_NAME"
   claude_agent_src="$src_dir/agents/$CLAUDE_AGENT_FILE"
   codex_role_src="$src_dir/instructions/$CODEX_ROLE_FILE"
 
@@ -451,6 +456,8 @@ cmd_install() {
   [[ -f "$hook_json_src" ]]       || die "hook JSON fragment not found: $hook_json_src"
   [[ -f "$codex_hook_json_src" ]] || die "codex hook JSON fragment not found: $codex_hook_json_src"
   [[ -f "$launcher_src" ]]        || die "reviewer launcher not found: $launcher_src"
+  [[ -f "$session_helper_src" ]]  || die "session lookup helper not found: $session_helper_src"
+  [[ -f "$codex_start_src" ]]     || die "named Codex startup helper not found: $codex_start_src"
   [[ -f "$claude_agent_src" ]]    || die "claude reviewer agent not found: $claude_agent_src"
   [[ -f "$codex_role_src" ]]      || die "codex reviewer instructions not found: $codex_role_src"
 
@@ -475,6 +482,10 @@ cmd_install() {
 
   info "Installing reviewer launcher to $INSTALL_DIR/$LAUNCHER_NAME"
   copy_script "$launcher_src" "$INSTALL_DIR/$LAUNCHER_NAME"
+
+  info "Installing session lookup helper to $INSTALL_DIR/$SESSION_HELPER_NAME"
+  copy_script "$session_helper_src" "$INSTALL_DIR/$SESSION_HELPER_NAME"
+  copy_script "$codex_start_src" "$INSTALL_DIR/$CODEX_START_HELPER_NAME"
 
   info "Installing codex reviewer instructions to $CODEX_ROLE_DIR/$CODEX_ROLE_FILE"
   mkdir -p "$CODEX_ROLE_DIR"
@@ -533,6 +544,16 @@ cmd_status() {
   warn_if_no_bridge
 }
 
+reviewer_session() {
+  command -v python3 >/dev/null 2>&1 || return 0
+  local directory helper
+  directory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+  helper="$directory/$SESSION_HELPER_NAME"
+  [[ -f "$helper" ]] || helper="$directory/scripts/$SESSION_HELPER_NAME"
+  [[ -f "$helper" ]] || return 0
+  python3 "$helper" "$1" || true
+}
+
 cmd_start() {
   in_tmux || die "not inside a tmux session (\$TMUX is unset)"
 
@@ -554,27 +575,66 @@ cmd_start() {
 
   command -v "$binary" >/dev/null 2>&1 || die "'$binary' not found in PATH"
 
-  local launch_cmd
+  local session="" launch_directory="$PWD" session_name="" launch_cmd launch_description
+  # NUL-delimited fields preserve directory whitespace without shell evaluation.
+  {
+    IFS= read -r -d '' session &&
+    IFS= read -r -d '' launch_directory &&
+    IFS= read -r -d '' session_name
+  } < <(reviewer_session "$agent") || { session=""; launch_directory="$PWD"; session_name=""; }
+  launch_description="started '$agent'"
+  if [[ -n "$session" ]]; then
+    launch_description="resuming '$agent' session $session"
+  fi
   if command -v "$LAUNCHER_NAME" >/dev/null 2>&1; then
-    launch_cmd="$LAUNCHER_NAME $agent"
+    if [[ -n "$session" ]]; then
+      # The helper prints only validated UUIDs, never a user-supplied title.
+      launch_cmd="$LAUNCHER_NAME resume $agent $session"
+    elif [[ -n "$session_name" ]]; then
+      launch_cmd="$LAUNCHER_NAME named $agent"
+    else
+      launch_cmd="$LAUNCHER_NAME $agent"
+    fi
   else
     warn "'$LAUNCHER_NAME' not on PATH — launching $binary without reviewer role prompt (run 'kibitz install' to fix)"
+    if [[ -n "$session_name" ]]; then
+      warn "Cannot name a fresh reviewer without the reviewer launcher; starting without a name."
+      session_name=""
+    fi
     launch_cmd="$binary"
     if [[ "$agent" == codex ]]; then
       launch_cmd+=" --no-daemon"
     fi
+    if [[ -n "$session" ]]; then
+      case "$agent" in
+        codex) launch_cmd+=" resume $session" ;;
+        claude) launch_cmd+=" --resume $session" ;;
+      esac
+    fi
+  fi
+
+  local -a pane_env=(-e "CODEX_HOME=${CODEX_HOME:-$HOME/.codex}")
+  # Data crosses the tmux boundary as an environment value, never shell code.
+  pane_env+=(-e "KIBITZ_REVIEWER_NAME=$session_name")
+  if [[ "${CLAUDE_CONFIG_DIR+x}" == x ]]; then
+    pane_env+=(-e "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR")
+  else
+    # Explicitly setting even ~/.claude changes Claude's credential store.
+    # Clear a stale server value in the child as well as omitting the override.
+    launch_cmd="/usr/bin/env -u CLAUDE_CONFIG_DIR $launch_cmd"
   fi
 
   local host_pane="${TMUX_PANE:-}"
   [[ -n "$host_pane" ]] || die "\$TMUX_PANE is unset (need it to record the host pane)"
 
   local new_pane
-  new_pane=$(tmux split-window -h -P -F '#{pane_id}' -e "CODEX_HOME=${CODEX_HOME:-$HOME/.codex}" "$launch_cmd")
+  new_pane=$(tmux split-window -h -P -F '#{pane_id}' -c "$launch_directory" \
+    "${pane_env[@]}" "$launch_cmd")
   tmux set-option -p -t "$new_pane" @name "$label" >/dev/null
   tmux set-option -p -t "$new_pane" @kibitz_host_pane "$host_pane" >/dev/null
 
   cat <<BANNER
-kibitz: started '$agent' (labeled '$label').
+kibitz: $launch_description (labeled '$label').
 
 A kibitz reviewer is now watching this session from an adjacent tmux pane. Your user/assistant exchanges are forwarded to it automatically via a Stop hook — nothing to do on your end. By default the reviewer keeps its opinions in its own pane.
 
@@ -793,6 +853,8 @@ cmd_uninstall() {
     "$INSTALL_DIR/kibitz"
     "$INSTALL_DIR/tmux-bridge"
     "$INSTALL_DIR/$LAUNCHER_NAME"
+    "$INSTALL_DIR/$SESSION_HELPER_NAME"
+    "$INSTALL_DIR/$CODEX_START_HELPER_NAME"
     "$CODEX_ROLE_DIR/$CODEX_ROLE_FILE"
     "$CLAUDE_AGENTS_DIR/$CLAUDE_AGENT_FILE"
     "$HOOK_LOG_PATH"
@@ -845,6 +907,10 @@ Commands:
                      ancestor process is codex             -> spawns claude
                      unknown                               -> error
                    Valid agents: codex, claude.
+                   If the host has an explicit name, resume a reviewer with
+                   that exact name in the host session's directory. No match
+                   starts a fresh conversation with the host's name. An unnamed
+                   host starts unnamed; ambiguous/unavailable lookup also does.
                    No-op if a reviewer is already running in this window;
                    other windows get their own independent reviewer.
   stop             Kill the current reviewer pane (whichever agent).

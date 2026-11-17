@@ -114,6 +114,7 @@ All commands work whether you invoke `./kibitz` from the repo or `kibitz` from P
 
 ```bash
 # Start a sidecar. Auto-detects the host agent and launches the other one.
+# An explicitly named host reuses a matching reviewer in the host's directory.
 # Explicit override: `kibitz start codex` or `kibitz start claude`.
 kibitz start
 
@@ -141,6 +142,41 @@ kibitz relay "does the claim about X actually hold?"
 kibitz uninstall
 ```
 
+When the host has an explicit name, `kibitz start` first looks for a saved
+conversation belonging to the reviewer agent with the **exact same name and
+recorded working directory**. One match is resumed by ID with the usual Kibitz
+role and pane pairing. With no match, it starts a fresh conversation **with the
+host's name**, so the next start can resume it without a manual rename. Multiple
+matches, unavailable metadata, or no explicit host name start a fresh, unnamed
+conversation. Names in other directories
+are ignored; symlink paths resolving to the same directory count as the same
+location. A tool command's temporary working directory does not change the match:
+Kibitz uses the host conversation's recorded directory for lookup and launch.
+If the host directory cannot be identified or no longer exists, it starts fresh
+in the invoking shell's current directory. `restart` applies the same rule.
+
+For Claude hosts, only live session records marked `nameSource: user` qualify;
+derived folder names are ignored. For Codex hosts, Kibitz uses the saved name,
+never the first-message preview. Codex does not record whether a saved name came
+from `/rename` or another client. Claude reviewer matches use saved custom titles,
+not AI-generated titles. Names are inherited only at startup; renaming a running
+host does not rename its reviewer.
+
+Lookup is local and read-only. Kibitz checks for a saved conversation before
+launching, so a missing name starts fresh without opening a resume picker. It
+does not fall back to a new conversation for unrelated errors after launch.
+`CLAUDE_CONFIG_DIR` is preserved exactly when explicitly set and remains unset
+otherwise, so starting a reviewer does not select a different Claude login.
+
+Claude receives its new name through the native `--name` option. For Codex,
+Kibitz briefly runs a local app-server to create an empty thread, set and verify
+its name, and then open that thread in the reviewer TUI. This uses the
+[official OpenAI app-server protocol](https://learn.chatgpt.com/docs/app-server).
+No model turn or terminal keystrokes are used to name it. The temporary server
+has hooks disabled; the reviewer runs its usual hooks on resume. This adds a
+short startup step only for newly named Codex reviewers. A failed naming step
+reports an error instead of silently opening a second, unnamed conversation.
+
 ### Talking to the reviewer
 
 `tmux-bridge` is the communication layer. Labels are `codex` or `claude-reviewer` depending on which agent is running.
@@ -164,6 +200,9 @@ kibitz/
 │   ├── kibitz_codex_stop.py                # Codex Stop hook — stashes last_assistant_message for `kibitz relay`
 │   └── kibitz_codex_hooks.json             # ~/.codex/hooks.json fragment `install` merges in
 ├── scripts/
+│   ├── kibitz_reviewer_launch  # fresh/resumed reviewer role setup
+│   ├── kibitz_session.py       # explicit host name and same-directory session lookup
+│   ├── kibitz_codex_start.py   # create and name an empty Codex thread before opening its TUI
 │   └── tmux-bridge             # vendored from ShawnPana/smux
 ├── LICENSE
 └── README.md
@@ -178,6 +217,9 @@ After install, the runtime copies land in `~/.local/bin/`:
 ├── kibitz_hook_user_prompt_submit.py
 ├── kibitz_hook_common.py
 ├── kibitz_codex_stop.py
+├── kibitz_reviewer_launch
+├── kibitz_session.py
+├── kibitz_codex_start.py
 └── tmux-bridge
 ```
 
@@ -237,7 +279,7 @@ with its existing conversation and Kibitz role settings. The launcher accepts
 - **Hook not forwarding (Claude side)** — check `~/.claude/kibitz-hook.log`. The hook always exits 0 (so it can't block your session), and routes errors there.
 - **`kibitz relay` says `no relay payload`** — the codex Stop hook hasn't written a stash for this thread yet. Check `$XDG_CACHE_HOME/kibitz/log` for codex Stop hook errors and confirm `[features] codex_hooks = true` in `~/.codex/config.toml` — without it codex won't fire hooks at all. A claude-host relay that never arrives means the Claude Stop hook didn't run or failed; check `~/.claude/kibitz-hook.log`, and note the hook only runs when Claude's turn ends.
 - **`kibitz relay` says `CODEX_THREAD_ID is not set`** — only the codex-reviewer path requires it; the claude-host path keys on `$TMUX_PANE`. You're likely running relay from a codex-labeled pane where codex didn't inherit the env var (unusual — it's normally exported automatically).
-- **`couldn't detect host agent`** — host detection is Linux-only (`/proc/$PPID/exe`). On macOS, or when running through an unusual wrapper, pass the agent explicitly: `kibitz start codex`.
+- **`couldn't detect host agent`** — Kibitz uses `CLAUDECODE` or `CODEX_THREAD_ID` when available, then process ancestry on Linux. When running through a shell or wrapper without those markers, pass the agent explicitly: `kibitz start codex`.
 - **Stale reviewer pane** — if `kibitz status` reports a pane that no longer exists, something killed the pane outside of kibitz. Run `kibitz stop` to clear the label, then `kibitz start`.
 
 ## Uninstall

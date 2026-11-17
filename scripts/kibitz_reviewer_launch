@@ -5,7 +5,10 @@
 # the tmux command-string boundary).
 set -euo pipefail
 
-agent="${1:?usage: kibitz_reviewer_launch codex|claude | resume codex|claude SESSION}"
+agent="${1:?usage: kibitz_reviewer_launch codex|claude | resume codex|claude SESSION | named codex|claude}"
+name="${KIBITZ_REVIEWER_NAME:-}"
+unset KIBITZ_REVIEWER_NAME
+named=0
 shift
 if [[ "$agent" == resume ]]; then
   [[ $# -eq 2 ]] || { echo "usage: kibitz_reviewer_launch resume codex|claude SESSION" >&2; exit 2; }
@@ -16,6 +19,11 @@ if [[ "$agent" == resume ]]; then
     codex) set -- resume "$session" ;;
     claude) set -- --resume "$session" ;;
   esac
+elif [[ "$agent" == named ]]; then
+  [[ $# -eq 1 && -n "$name" ]] || { echo "named reviewer requires an agent and KIBITZ_REVIEWER_NAME" >&2; exit 2; }
+  named=1
+  agent="$1"
+  shift
 elif [[ $# -ne 0 ]]; then
   echo "use kibitz_reviewer_launch resume codex|claude SESSION to resume a reviewer" >&2
   exit 2
@@ -28,14 +36,23 @@ case "$agent" in
     # for outbound sockets — without it, tmux(1) inside this pane can't reach
     # /private/tmp/tmux-*/default, so `kibitz send`/`status` silently fail.
     # Keep Codex and its hooks in the pane's process tree.
+    config_args=(--config sandbox_workspace_write.network_access=true)
     if [[ -f "$role_file" ]]; then
-      exec codex --no-daemon \
-        --config sandbox_workspace_write.network_access=true \
-        --config developer_instructions="$(<"$role_file")" "$@"
+      config_args+=(--config developer_instructions="$(<"$role_file")")
     fi
-    exec codex --no-daemon --config sandbox_workspace_write.network_access=true "$@"
+    if (( named )); then
+      directory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+      if ! session=$(python3 "$directory/kibitz_codex_start.py" "$name" "${config_args[@]}"); then
+        printf '%s\n' '[kibitz] Reviewer startup failed. Press Enter to close this pane.' >&2
+        if [[ -t 0 ]]; then read -r ignored || true; fi
+        exit 1
+      fi
+      set -- resume "$session"
+    fi
+    exec codex --no-daemon "${config_args[@]}" "$@"
     ;;
   claude)
+    if (( named )); then set -- --name "$name"; fi
     if [[ -f "$HOME/.claude/agents/kibitz-reviewer.md" ]]; then
       exec claude --agent kibitz-reviewer "$@"
     fi

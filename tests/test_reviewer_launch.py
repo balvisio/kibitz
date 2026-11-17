@@ -50,6 +50,21 @@ class ReviewerLaunchTest(unittest.TestCase):
                          ["--no-daemon", "--config", "sandbox_workspace_write.network_access=true", "resume", "thread-one"])
         self.assertEqual(self.launch("resume", "claude", "session-one"), ["--resume", "session-one"])
 
+    def test_claude_named_start_uses_the_native_name_option(self):
+        name = "review's name $value `literal`\nnext"
+        self.env["KIBITZ_REVIEWER_NAME"] = name
+        self.assertEqual(self.launch("named", "claude"), ["--agent", "kibitz-reviewer", "--name", name])
+        self.assertEqual(self.launch("claude"), ["--agent", "kibitz-reviewer"])
+        self.assertEqual(self.launch("resume", "claude", "existing"),
+                         ["--agent", "kibitz-reviewer", "--resume", "existing"])
+
+    def test_named_mode_requires_a_name(self):
+        self.env.pop("KIBITZ_REVIEWER_NAME", None)
+        result = subprocess.run([str(LAUNCHER), "named", "claude"], env=self.env,
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(result.stdout)
+
     def test_invalid_resume_never_starts_a_fresh_conversation(self):
         for args in (("resume", "codex"), ("resume", "claude", ""),
                      ("codex", "resume", "thread-one"), ("resume", "unknown", "thread-one")):
