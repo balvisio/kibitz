@@ -14,6 +14,7 @@ HOOK_SCRIPTS=(
   "kibitz_hook_stop.py"
   "kibitz_hook_user_prompt_submit.py"
   "kibitz_hook_common.py"
+  "kibitz_processes.py"
   "kibitz_notifications.py"
   "kibitz_codex_stop.py"
 )
@@ -269,6 +270,7 @@ def has_our_cmd(group):
             return True
     return False
 
+added_codex_prompt_hook = False
 for event, new_groups in fragment.items():
     existing = hooks.setdefault(event, [])
     if not isinstance(existing, list):
@@ -278,11 +280,18 @@ for event, new_groups in fragment.items():
         continue
     for g in new_groups:
         existing.append(g)
+        if event == "UserPromptSubmit" and any(
+                basename(h.get("command", "")) == "kibitz_codex_stop.py"
+                for h in g.get("hooks", [])):
+            added_codex_prompt_hook = True
 
 settings_path.parent.mkdir(parents=True, exist_ok=True)
 with settings_path.open("w") as f:
     json.dump(settings, f, indent=2)
     f.write("\n")
+if added_codex_prompt_hook:
+    print("kibitz: Added Codex /tee hook. Restart or resume running Codex sessions, "
+          "then open /hooks and trust the new hook.")
 PY
 }
 
@@ -429,6 +438,9 @@ cmd_install() {
   command -v python3 >/dev/null 2>&1 \
     || die "python3 is required on PATH (needed by the Stop hook and settings merge)"
 
+  python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' \
+    || die "Python 3.10 or newer is required"
+
   local src_dir kibitz_src bridge_src hook_json_src codex_hook_json_src launcher_src session_helper_src codex_start_src claude_agent_src codex_role_src
   if [[ -f "${BASH_SOURCE[0]:-}" ]]; then
     src_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -541,6 +553,8 @@ cmd_status() {
   panel_info=$(tmux display-message -t "$pane" -p \
     '#{session_name}:#{window_index}.#{pane_index} (#{pane_width}x#{pane_height})' 2>/dev/null || true)
   echo "kibitz: running as '$label' on pane $pane — $panel_info"
+  tmux list-panes -t "$pane" -f '#{!=:#{@kibitz-delivery-error},}' \
+    -F '#{pane_id}: #{@kibitz-delivery-error}' 2>/dev/null || true
   warn_if_no_bridge
 }
 
@@ -673,38 +687,26 @@ cmd_restart() {
 # host pane ID from the pane-local @kibitz_host_pane option that cmd_start
 # stamped on the reviewer pane — so two windows each with their own
 # claude+codex pair route independently. Shared by `send` and `relay`.
+# Resolve the helper next to an installed CLI or inside a source checkout.
+_delivery_helper() {
+  local directory="${BASH_SOURCE[0]}"
+  if [[ "$directory" == */* ]]; then directory="${directory%/*}"; else directory="."; fi
+  directory="$(cd -- "$directory" && pwd)"
+  if [[ -f "$directory/hooks/kibitz_hook_common.py" ]]; then
+    printf '%s\n' "$directory/hooks/kibitz_hook_common.py"
+  else
+    printf '%s\n' "$directory/kibitz_hook_common.py"
+  fi
+}
+
 _relay_to_host() {
-  local text="$1"
-  in_tmux || die "not inside a tmux session (\$TMUX is unset)"
-  [[ -n "$text" ]] || die "empty message — nothing to relay"
-
-  local my_pane="${TMUX_PANE:-}"
-  [[ -n "$my_pane" ]] || die "\$TMUX_PANE is unset"
-
-  local host_pane my_label
-  host_pane=$(tmux display-message -t "$my_pane" -p '#{@kibitz_host_pane}' 2>/dev/null || true)
-  my_label=$(tmux display-message -t "$my_pane" -p '#{@name}' 2>/dev/null || true)
-
-  [[ -n "$host_pane" ]] \
-    || die "not running inside a kibitz reviewer pane (no @kibitz_host_pane on $my_pane)"
-
-  tmux display-message -t "$host_pane" -p '#{pane_id}' >/dev/null 2>&1 \
-    || die "host pane $host_pane no longer exists — run '$(basename "$0") restart' from the host"
-
-  has_bridge || die "tmux-bridge not found in PATH (run: $(basename "$0") install)"
-
-  local agent
-  case "$my_label" in
-    codex)           agent="codex" ;;
-    claude-reviewer) agent="claude" ;;
-    *)               agent="${my_label:-reviewer}" ;;
-  esac
-
-  # Read satisfies tmux-bridge's read-guard before message/keys.
-  tmux-bridge read "$host_pane" 1 >/dev/null
-  tmux-bridge message --header "[kibitz from:$agent]" "$host_pane" "$text"
-  tmux-bridge read "$host_pane" 1 >/dev/null
-  tmux-bridge keys "$host_pane" Enter
+  local text="$1" force="${2:-0}" helper
+  helper=$(_delivery_helper)
+  if [[ "$force" == 1 ]]; then
+    printf '%s' "$text" | python3 "$helper" host --force
+  else
+    printf '%s' "$text" | python3 "$helper" host
+  fi
 }
 
 cmd_send() {
@@ -716,25 +718,9 @@ cmd_send() {
 # is supported as a host today, so the header is fixed to [kibitz from:claude].
 # Finds the reviewer via find_reviewer_pane (scoped to the current window).
 _relay_to_reviewer() {
-  local text="$1"
-  in_tmux || die "not inside a tmux session (\$TMUX is unset)"
-  [[ -n "$text" ]] || die "empty message — nothing to relay"
-
-  local reviewer_line
-  reviewer_line=$(find_reviewer_pane)
-  [[ -n "$reviewer_line" ]] \
-    || die "no reviewer pane in this window — run '$(basename "$0") start' first"
-  local reviewer_pane="${reviewer_line%% *}"
-
-  tmux display-message -t "$reviewer_pane" -p '#{pane_id}' >/dev/null 2>&1 \
-    || die "reviewer pane $reviewer_pane no longer exists — run '$(basename "$0") restart'"
-
-  has_bridge || die "tmux-bridge not found in PATH (run: $(basename "$0") install)"
-
-  tmux-bridge read "$reviewer_pane" 1 >/dev/null
-  tmux-bridge message --header "[kibitz from:claude]" "$reviewer_pane" "$text"
-  tmux-bridge read "$reviewer_pane" 1 >/dev/null
-  tmux-bridge keys "$reviewer_pane" Enter
+  local helper
+  helper=$(_delivery_helper)
+  printf '%s' "$1" | python3 "$helper" reviewer
 }
 
 # Parse the two-field JSON stashed by the Stop hooks ({turn_id, message}).
@@ -784,6 +770,9 @@ cmd_relay() {
   local my_pane="${TMUX_PANE:-}"
   [[ -n "$my_pane" ]] || die "\$TMUX_PANE is unset"
 
+  local helper
+  helper=$(_delivery_helper)
+  python3 "$helper" validate-source || return 1
   local my_label
   my_label=$(tmux display-message -t "$my_pane" -p '#{@name}' 2>/dev/null || true)
 
@@ -797,7 +786,6 @@ cmd_relay() {
     reviewer_line=$(find_reviewer_pane)
     [[ -n "$reviewer_line" ]] \
       || die "no reviewer pane in this window — run '$(basename "$0") start' first"
-    has_bridge || die "tmux-bridge not found in PATH (run: $(basename "$0") install)"
     # Nothing is written anywhere: Claude Code records this output in the
     # transcript, and the Claude Stop hook reacts to the marker line once.
     # Exact lines the Claude Stop hook matches (RELAY_LINE / RELAY_LINE_FORCE
@@ -830,7 +818,7 @@ cmd_relay() {
     message="CODEX:"$'\n'"${message}"$'\n\n'"USER:"$'\n'"${note}"
   fi
 
-  _relay_to_host "$message"
+  _relay_to_host "$message" "$force"
   info "relayed codex turn ${turn_id:-<no-id>} to host"
 }
 

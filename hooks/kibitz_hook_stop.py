@@ -33,6 +33,7 @@ import hashlib
 import json
 import re
 import sys
+import kibitz_hook_common as common
 
 from kibitz_notifications import (
     notify, remembered_prompt, forget_prompt, unrecorded_prompts, resolved_queued_prompts,
@@ -218,7 +219,7 @@ def send_queued_relay(pane_id, entries, anchor, note, force):
     try:
         forward(pane_id, f"[kibitz from:claude]\n\n{body}", force=force)
     except Exception as e:
-        log(f"relay: forward failed; dropped: {e}")
+        common.report_delivery_failure(e)
 
 
 def exchange_history(entries):
@@ -342,6 +343,8 @@ def main():
         log(f"bad stdin json: {e}")
         return 0
 
+    if not isinstance(payload, dict) or not common.valid_source():
+        return 0
     pane_label = current_pane_label()
 
     transcript = payload.get("transcript_path")
@@ -444,16 +447,17 @@ def main():
         f"CLAUDE:\n{assistant_text}"
     )
 
-    notify("queue", notification_payload, pane_id, message)
     try:
-        forward(pane_id, message)
+        forward(pane_id, message,
+                expected_agent="codex" if _reviewer_label == "codex" else "claude",
+                before_paste=lambda: notify("queue", notification_payload, pane_id, message))
         try:
             LAST_FORWARD_PATH.write_text(fingerprint)
         except Exception:
             pass
     except Exception as e:
-        notify("fail", notification_payload, pane_id)
-        log(f"forward failed: {e}")
+        notify(common.delivery_failure_action(e), notification_payload, pane_id)
+        common.report_delivery_failure(e)
     forget_prompt(notification_payload)
 
     return 0

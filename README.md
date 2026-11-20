@@ -7,7 +7,7 @@ Named after the Yiddish *kibbitzer* — the spectator who can't resist offering 
 ## What it does
 
 - `kibitz start` splits the current tmux window (vertical divider), launches the reviewer agent in the new pane, labels the pane via smux (`codex` or `claude-reviewer`).
-- A Claude Code `Stop` hook extracts the latest user + assistant turn from the session transcript and forwards them to the reviewer pane using `tmux-bridge`.
+- A Claude Code `Stop` hook extracts the latest user + assistant turn from the session transcript and forwards them through Kibitz’s guarded sender to the reviewer pane.
 - The reviewer sends messages back two ways, both prepend a `[kibitz from:<agent>]` header so the host can tell them apart from real user input:
   - `kibitz send "<text>"` — send custom text.
   - `kibitz relay [text]` — forward the agent's own last assistant reply verbatim to its counterpart pane. With text, the reply goes out framed as a `CLAUDE:` (or `CODEX:`) block followed by a `USER:` block holding the text — your own note or question about that reply. From a claude host pane the relay is sent by the Claude `Stop` hook when the current turn ends (one attempt); it sends the reply that was shown above your input when you ran the command, so rewinding first is honored. Deliveries (relays and forwarded exchanges alike) check codex's rollout log first: if codex is mid-task the text is submitted with Tab, which codex queues for after the current task; `kibitz relay --force <text>` submits with Enter and interrupts. From a codex reviewer pane it forwards codex's last reply immediately, read from the `codex-<thread>.msg` stash the codex `Stop` hook writes under `$XDG_CACHE_HOME/kibitz/` keyed on `CODEX_THREAD_ID`. No dedupe — running `relay` twice on the same turn sends twice.
@@ -19,7 +19,7 @@ Named after the Yiddish *kibbitzer* — the spectator who can't resist offering 
 - **Reviewer is read-only by default.** The sidecar is meant to watch and comment, not drive. It should only message the host back when the user explicitly asks it to relay something.
 - **Host can tell who typed what.** Anything that arrives at the host with a `[kibitz from:<agent>]` header came from the reviewer (emitted by `kibitz send`). Anything without it is real user input.
 - **Slash commands are not forwarded.** If the most recent user turn starts with `/` (like `/clear`), the Stop hook skips forwarding that exchange.
-- **Recursion-safe.** If the hook runs inside a pane already labeled `codex` or `claude-reviewer`, it no-ops — so nesting sessions doesn't create a forwarding loop.
+- **Recursion-safe.** Automatic review forwarding is disabled in reviewer panes. An explicit `/tee` works from either pane, but messages carrying a `[kibitz from:...]` header are never forwarded back.
 
 ### Directives
 
@@ -34,13 +34,36 @@ Append one of these tokens to the end of your message to change what the reviewe
 | `/tee` (bare)             | nothing                      | nothing                        |
 
 - `/mute` — skip forwarding this exchange entirely. Useful for side chatter you don't want the reviewer to spend context on.
-- `/tee` — send your message to the reviewer immediately (via a `UserPromptSubmit` hook), and *don't* forward Claude's reply. Useful when you want the reviewer to work on the same problem in parallel rather than critique the answer. If the submit-time forward fails (transport glitch, reviewer pane gone), the turn isn't silently retried at Stop time — errors land in `~/.claude/kibitz-hook.log` and you can resend with `/tee` manually.
+- `/tee` — send your message immediately to the paired agent, from **either Claude or Codex**, in either the host or reviewer pane. For example, `Explain this error /tee` in Codex also sends `Explain this error` to its paired Claude pane. Only the user's prompt is shared; neither reply is sent back automatically. Pairing uses the pane IDs recorded by `kibitz start`, so other pairs and the currently focused pane do not affect delivery. If the submit-time forward fails, it is logged in `~/.claude/kibitz-hook.log` and is not retried at Stop time. Follow the delivery diagnostic before retrying.
 
-Claude itself still sees the `/mute` or `/tee` suffix in your prompt — Claude Code hooks can observe a prompt but can't rewrite it in place. Treat the trailing directive as benign noise; the model ignores it.
+The table's automatic reply forwarding applies to a Claude host. Ordinary prompts in Codex and in reviewer panes stay local; `/tee` explicitly shares a prompt from those panes. A bare `/tee` sends nothing. The paired panes must still be in the same tmux window.
+
+`/tee`, `kibitz send`, `kibitz relay`, and automatic reply forwarding all check that the destination
+has a live foreground agent and a normal prompt before pasting, then check again before submitting.
+The sending process must descend from the pane it claims; a daemon with another pane's environment
+cannot route a message or replace that pane's delivery metadata. It refuses shell prompts, permission/question dialogs,
+copy mode and unknown input screens. Claude's native session status is checked independently of
+the indicator colour. Claude at a normal prompt with a background shell is allowed. Long input and
+existing drafts are allowed; a draft may be submitted together with the forwarded message.
+A brief cursor redraw is retried for up to three seconds within the same attempt. Permission
+questions and changed agent identities stop delivery. The target is reread after reserving a review;
+tmux rechecks its composer/footer text, cursor, and mode with the paste and submit commands.
+If the destination is unavailable, Kibitz logs the reason and shows a tmux status message.
+`kibitz status` includes outstanding delivery errors. The latest error also remains in the source pane's `@kibitz-delivery-error` option until a successful
+send, and in `/tmp/kibitz-<uid>/delivery-errors.log`. Process checks use native macOS APIs or Linux
+`/proc`, and delivery locks live in that private temporary directory, including inside a Codex tool sandbox. “Not sent”
+means no paste occurred. “Text pasted, but no submit key sent” or “delivery unconfirmed” means you
+should inspect the other pane before retrying, to avoid sending the same message twice. No delivery
+is automatically retried. `--force` only selects Enter instead of Tab for a busy Codex; it never
+bypasses these checks. Busy rollout records are checked against the live agent and tmux server.
+These checks reduce terminal-input races; the application can still change state between a check
+and receiving a keystroke. They do not provide atomic delivery into the agent.
+
+Both agents still see the `/mute` or `/tee` suffix in your original prompt; Kibitz strips it only from the forwarded copy. Treat the trailing directive as benign noise.
 
 ### Completion sounds with tmux-agent-indicator
 
-Update and reinstall both Kibitz and tmux-agent-indicator to group completion sounds. A window rings
+With tmux-agent-indicator installed, a window rings
 once after Claude and its reviewer are ready, including reviews queued behind earlier work. `/mute`
 needs no review; `/tee` waits for the review started when you submitted the prompt. Ctrl+C cancels the
 interrupted review without announcing successful completion. If Codex returns a queued review to its
@@ -58,15 +81,20 @@ work. It checks the exact prompt text, transcript checkpoint, pane and session; 
 prompts require distinct delivery records. A queue entry by itself does not count as delivery.
 Other background work remains pending until it finishes; review reservations have no time limit.
 
-The integration uses Claude prompt IDs and the reviewer's turn IDs. Delivery failures are logged in
+The integration uses Claude prompt IDs or Codex turn IDs, and the reviewer's turn IDs.
+Merged `/tee` prompts and drafts recognize both `[kibitz from:claude]` and `[kibitz from:codex]` headers. Delivery failures are logged in
 `~/.claude/kibitz-hook.log`; the indicator also exposes `@agent-indicator-notification-error` on the
-window. Restart the pair after resolving a failed delivery. Kibitz works without the indicator installed.
+window. A refusal proven to have pasted nothing retires that attempt, so it cannot hold the completion
+bell or steal a later retry's receipt. A retry of the same message replaces older attempts known to have sent no submit key.
+Unconfirmed submissions remain tracked;
+a receiver hook can confirm them. If you discard such a message, restart the pair to clear its
+unconfirmed review. Kibitz works without the indicator installed.
 
 ## Requirements
 
-- Linux (host detection reads `/proc`; macOS fallback is explicit-arg-only)
-- tmux 3.2+
-- `python3` on PATH
+- macOS or Linux
+- tmux 3.7+
+- Python 3.10+ (`python3` on PATH)
 - `curl` or `wget` (for install)
 - One of `codex` or `claude` CLIs on PATH for whichever agents you want to run
 
@@ -100,13 +128,17 @@ What install does:
 1. Verifies `python3` is on PATH.
 2. Copies `scripts/tmux-bridge`, `kibitz`, and the `hooks/kibitz_*.py` scripts (Claude hooks + `kibitz_codex_stop.py`) into `~/.local/bin/`.
 3. Merges the Stop and UserPromptSubmit hook entries from `hooks/kibitz_hook.json` into `~/.claude/settings.json` (idempotent — won't duplicate on reinstall, preserves any other hooks you have).
-4. Merges the codex SessionStart and Stop hooks from `hooks/kibitz_codex_hooks.json` into `~/.codex/hooks.json` (same idempotent behavior), and sets `[features] codex_hooks = true` in `~/.codex/config.toml` so codex actually fires hooks. If `codex_hooks` is already set to `false` the installer warns and leaves it alone.
+4. Merges the Codex SessionStart, UserPromptSubmit and Stop hooks from `hooks/kibitz_codex_hooks.json` into `~/.codex/hooks.json` (same idempotent behavior), and sets `[features] codex_hooks = true` in `~/.codex/config.toml` so Codex actually fires hooks. If `codex_hooks` is already set to `false` the installer warns and leaves it alone.
 5. Adds `~/.local/bin/` to `PATH` in your shell rc (`.zshrc` / `.bashrc` / `.profile`) if it isn't already.
 6. Warns if `codex` or `claude` binaries are missing (non-fatal).
 
 `tmux-bridge` is vendored from [`ShawnPana/smux`](https://github.com/ShawnPana/smux) under `scripts/`.
 
 After install, open a new shell (or `source` your rc) so `PATH` picks up the new entries.
+
+After updating an existing installation, restart/resume Codex so it loads the
+new UserPromptSubmit hook. Approve the updated hooks in `/hooks` if Codex asks.
+Claude's existing prompt hook uses the updated script on its next invocation.
 
 ## Usage
 
@@ -179,7 +211,8 @@ reports an error instead of silently opening a second, unnamed conversation.
 
 ### Talking to the reviewer
 
-`tmux-bridge` is the communication layer. Labels are `codex` or `claude-reviewer` depending on which agent is running.
+Kibitz's guarded sender handles forwarding. `tmux-bridge` remains available for direct terminal
+control; its raw `type` and `keys` commands do not apply Kibitz's delivery checks. Labels are `codex` or `claude-reviewer` depending on which agent is running.
 
 ```bash
 tmux-bridge read codex 30               # read last 30 lines of the reviewer pane
@@ -194,10 +227,10 @@ kibitz/
 ├── kibitz                      # the management script (bash)
 ├── hooks/
 │   ├── kibitz_hook_stop.py                 # Claude Code Stop hook — forwards user/assistant exchange, stashes last_assistant_message for `kibitz relay`
-│   ├── kibitz_hook_user_prompt_submit.py   # Claude Code UserPromptSubmit hook — implements `/tee`
-│   ├── kibitz_hook_common.py               # shared helpers imported by both Claude hooks
+│   ├── kibitz_hook_user_prompt_submit.py   # shared prompt handler — implements `/tee` in either direction
+│   ├── kibitz_hook_common.py               # shared pairing, directive and transport helpers
 │   ├── kibitz_hook.json                    # settings.json fragment `install` merges in
-│   ├── kibitz_codex_stop.py                # Codex Stop hook — stashes last_assistant_message for `kibitz relay`
+│   ├── kibitz_codex_stop.py                # Codex hooks — prompt forwarding, rollout mapping and relay stash
 │   └── kibitz_codex_hooks.json             # ~/.codex/hooks.json fragment `install` merges in
 ├── scripts/
 │   ├── kibitz_reviewer_launch  # fresh/resumed reviewer role setup
@@ -251,6 +284,13 @@ And to `~/.codex/hooks.json`:
 ```json
 {
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "$HOME/.local/bin/kibitz_codex_stop.py" }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [
@@ -274,6 +314,13 @@ with its existing conversation and Kibitz role settings. The launcher accepts
 `kibitz_reviewer_launch resume codex SESSION` or `kibitz_reviewer_launch resume claude SESSION`.
 
 ## Troubleshooting
+
+- **`/tee` from Codex does nothing after an upgrade** — exit and resume the running Codex session,
+  then open `/hooks` and trust the newly installed Kibitz `UserPromptSubmit` hook. The installer
+  prints this notice when it adds that hook. Also check `~/.claude/kibitz-hook.log` for an unresolved
+  pair or a source-pane validation failure.
+- **Delivery requires tmux 3.7** — upgrade the tmux server as well as the binary. A server started
+  with an older version must be restarted before the guarded sender can use it.
 
 - **`tmux-bridge not found`** — run `kibitz install`, or check that `~/.local/bin` is on `PATH`.
 - **Hook not forwarding (Claude side)** — check `~/.claude/kibitz-hook.log`. The hook always exits 0 (so it can't block your session), and routes errors there.

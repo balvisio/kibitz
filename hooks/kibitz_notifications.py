@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import kibitz_hook_common as common
 
 from kibitz_hook_common import CACHE_DIR, extract_text, is_skippable_user_text, is_task_notification, log
 
@@ -20,12 +21,10 @@ def notify(action, payload, reviewer=None, message=None, prompt_ids=None):
     plugin = Path(os.environ.get("TMUX_AGENT_INDICATOR_DIR") or
                   Path.home() / ".tmux/plugins/tmux-agent-indicator")
     script = plugin / "scripts/agent-notify.sh"
-    if not script.is_file():
+    if not script.is_file() or not common.valid_source():
         return
     try:
-        pid = subprocess.check_output(
-            ["tmux", "display-message", "-p", "-t", host, "#{pane_pid}"],
-            text=True, timeout=5).strip()
+        pid = common.source_context()["pane_pid"]
         data = dict(action=action, host=host, host_pid=pid,
                     session_id=session, prompt_id=prompt)
         if reviewer:
@@ -55,6 +54,8 @@ def prompt_owner():
 
 
 def remember_prompt(payload):
+    if not common.valid_source():
+        return
     path = prompt_path(payload)
     if path is None:
         return

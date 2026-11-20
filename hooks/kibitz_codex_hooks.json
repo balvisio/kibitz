@@ -6,6 +6,13 @@
       ]
     }
   ],
+  "UserPromptSubmit": [
+    {
+      "hooks": [
+        { "type": "command", "command": "$HOME/.local/bin/kibitz_codex_stop.py" }
+      ]
+    }
+  ],
   "Stop": [
     {
       "hooks": [

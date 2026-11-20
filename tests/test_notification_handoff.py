@@ -24,6 +24,15 @@ def task_attachment(task, status='completed'):
 
 class HandoffTest(unittest.TestCase):
     def setUp(self):
+        import kibitz_hook_common as common
+        context = dict(pane="%7", pane_pid="10", tty="/dev/pts/1", server="fixture,1",
+                       ancestors={11: dict(command="codex", started="new", parent=10)})
+        source_patch = patch.object(common, "source_context", return_value=context)
+        source_patch.start()
+        self.addCleanup(source_patch.stop)
+        report_patch = patch.object(common, "report_delivery_failure")
+        report_patch.start()
+        self.addCleanup(report_patch.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
@@ -35,10 +44,11 @@ class HandoffTest(unittest.TestCase):
                 ('notify', lambda action, payload, *args, **kw: (self.events.extend((action, p) for p in kw.get('prompt_ids', [payload['prompt_id']])) or True)),
                 ('resolve_reviewer', lambda: ('%9', 'codex')),
                 ('current_pane_label', lambda: ''),
-                ('forward', lambda pane, message, **kw: self.sent.append(message)),
+                ('forward' if module is stop else 'forward_prompt', lambda pane, message, **kw: ((kw.get('before_paste') or (lambda: None))(), self.sent.append(message))),
             ):
                 p = patch.object(module, name, value); p.start(); self.addCleanup(p.stop)
         p=patch.object(stop, 'LAST_FORWARD_PATH', self.root/'last');p.start();self.addCleanup(p.stop)
+        p=patch.object(prompt, 'resolve_counterpart', return_value=('%9', 'codex', True));p.start();self.addCleanup(p.stop)
         self.payload = dict(session_id='session', prompt_id='one')
 
     def submit(self, text):
@@ -626,11 +636,29 @@ class HandoffTest(unittest.TestCase):
         self.assertIn('USER:\nfresh prompt', self.sent[0])
         self.assertIsNone(notifications.remembered_prompt(self.payload))
 
+    def test_refused_automatic_forward_retires_its_undelivered_review(self):
+        import kibitz_hook_common as common
+        self.submit('question')
+        with patch.object(stop, 'forward', side_effect=common.DeliveryRefused('waiting')):
+            self.finish()
+        self.assertEqual(self.events, [('expect', 'one'), ('undelivered', 'one')])
+        self.assertIsNone(notifications.remembered_prompt(self.payload))
+
+    def test_partially_pasted_automatic_forward_keeps_its_reservation(self):
+        import kibitz_hook_common as common
+        self.submit('question')
+        def partial(*args, **kwargs):
+            kwargs['before_paste']()
+            raise common.DeliveryRefused('target changed', stage='pasted')
+        with patch.object(stop, 'forward', side_effect=partial):
+            self.finish()
+        self.assertEqual(self.events, [('expect', 'one'), ('queue', 'one'), ('unsubmitted', 'one')])
+
     def test_delivery_failure_is_reported_without_clearing_pending_review(self):
         self.submit('question')
         with patch.object(stop,'forward',side_effect=RuntimeError('fixture failure')), patch.object(stop,'log'):
             self.finish()
-        self.assertEqual(self.events, [('expect','one'),('queue','one'),('fail','one')])
+        self.assertEqual(self.events, [('expect','one'),('fail','one')])
 
 
 if __name__ == '__main__':

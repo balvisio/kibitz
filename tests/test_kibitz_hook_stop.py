@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "hooks"))
@@ -51,6 +52,15 @@ def running(*task_ids):
 
 class StopHookTest(unittest.TestCase):
     def setUp(self):
+        import kibitz_hook_common as common
+        context = dict(pane="%7", pane_pid="10", tty="/dev/pts/1", server="fixture,1",
+                       ancestors={11: dict(command="codex", started="new", parent=10)})
+        source_patch = patch.object(common, "source_context", return_value=context)
+        source_patch.start()
+        self.addCleanup(source_patch.stop)
+        report_patch = patch.object(common, "report_delivery_failure")
+        report_patch.start()
+        self.addCleanup(report_patch.stop)
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
         self.forwarded = []
@@ -58,7 +68,7 @@ class StopHookTest(unittest.TestCase):
                       ("forward", "resolve_reviewer", "current_pane_label", "LAST_FORWARD_PATH")}
         self.saved_log = common.LOG_PATH
         common.LOG_PATH = root / "hook.log"
-        hook.forward = lambda pane, message, force=False: self.forwarded.append(message)
+        hook.forward = lambda pane, message, force=False, **kw: ((kw.get("before_paste") or (lambda: None))(), self.forwarded.append(message))
         hook.resolve_reviewer = lambda: ("%9", "codex")
         hook.current_pane_label = lambda: ""
         hook.LAST_FORWARD_PATH = root / "kibitz-last.txt"
@@ -221,7 +231,7 @@ class StopHookTest(unittest.TestCase):
 
     def test_forced_relay_is_passed_through_as_force(self):
         seen = []
-        hook.forward = lambda pane, message, force=False: seen.append(force)
+        hook.forward = lambda pane, message, force=False, **kw: ((kw.get("before_paste") or (lambda: None))(), seen.append(force))
         entries = chain([human("A"), assistant("R0")])
         tail = self.shell_relay("u1", "note")
         self.stop(entries + tail, "Queued.")
