@@ -106,12 +106,17 @@ def is_task_notification(text):
 
 
 def is_reviewer_originated(text):
-    """Return True if the user message was relayed from the reviewer via
-    `kibitz send` — those carry a '[kibitz from:<agent>]' header. Replies to
-    such messages should not be forwarded back: the reviewer already saw its
-    own outbound text, and a round-trip produces a ping-pong loop with no new
-    information."""
-    return text.lstrip().startswith("[kibitz from:")
+    """Recognize incoming /tee, send and relay messages so replies stay local.
+
+    Claude may wrap a bracketed paste in a pasted_content block, in both the
+    prompt hook and its transcript. Inspect the start of that block, without
+    mistaking a header quoted later in an ordinary question for a delivery.
+    """
+    text = text.lstrip()
+    wrapper = re.match(r'<pasted_content id="[^"\r\n]+">\s*', text)
+    if wrapper:
+        text = text[wrapper.end():]
+    return text.startswith("[kibitz from:")
 
 
 def parse_directive(text):

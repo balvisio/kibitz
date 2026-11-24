@@ -16,6 +16,27 @@ def event(kind):
     return json.dumps({"timestamp": "t", "type": "event_msg", "payload": {"type": kind}})
 
 
+class IncomingMessageTest(unittest.TestCase):
+    def test_recognizes_claude_paste_wrappers_from_either_agent(self):
+        for agent in ("codex", "claude"):
+            message = f"[kibitz from:{agent}]\n\nUSER:\nhello"
+            for text in (message, "\n\n" + message,
+                         '\n\n<pasted_content id="30a7">\n' + message
+                         + '\n</pasted_content id="30a7">\n'):
+                with self.subTest(agent=agent, text=text):
+                    self.assertTrue(common.is_reviewer_originated(text))
+
+    def test_quoted_headers_are_not_incoming_messages(self):
+        for text in ("What does [kibitz from:codex] mean?",
+                     "```\n[kibitz from:codex]\n```",
+                     '<pasted_content id="1234">\nExplain [kibitz from:codex].'
+                     '\n</pasted_content id="1234">',
+                     '<pasted_content id="1234">\n```\n[kibitz from:codex]\n```'
+                     '\n</pasted_content id="1234">'):
+            with self.subTest(text=text):
+                self.assertFalse(common.is_reviewer_originated(text))
+
+
 class SenderTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

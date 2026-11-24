@@ -38,6 +38,10 @@ Append one of these tokens to the end of your message to change what the reviewe
 
 The table's automatic reply forwarding applies to a Claude host. Ordinary prompts in Codex and in reviewer panes stay local; `/tee` explicitly shares a prompt from those panes. A bare `/tee` sends nothing. The paired panes must still be in the same tmux window.
 
+Replies to an incoming `/tee` stay local even when Claude wraps the message as pasted content
+or finishes its answer after background work. The next ordinary Claude prompt still forwards
+normally. Use `kibitz relay` if you explicitly want to share the reply.
+
 `/tee`, `kibitz send`, `kibitz relay`, and automatic reply forwarding all check that the destination
 has a live foreground agent and a normal prompt before pasting, then check again before submitting.
 The sending process must descend from the pane it claims; a daemon with another pane's environment

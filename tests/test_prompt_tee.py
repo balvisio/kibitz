@@ -96,6 +96,17 @@ class TeeTest(unittest.TestCase):
         self.forward.assert_not_called()
         self.peer.assert_not_called()
 
+    def test_claude_host_skips_review_for_an_incoming_wrapped_tee(self):
+        self.mock(prompt, "current_pane_label", return_value="")
+        self.reviewer.return_value = ("%9", "codex")
+        text = ('\n\n<pasted_content id="30a7">\n[kibitz from:codex]'
+                '\n\nUSER:\nhello\n</pasted_content id="30a7">\n')
+        self.submit(text, agent="claude")
+        self.forward.assert_not_called()
+        self.peer.assert_not_called()
+        self.remember.assert_called_once()
+        self.assertEqual([call.args[0] for call in self.notify.call_args_list], ["expect", "skip"])
+
     def test_codex_internal_thread_cannot_forward_or_replace_rollout(self):
         self.submit("Question /tee", transcript_path=None)
         self.forward.assert_not_called()

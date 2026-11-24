@@ -108,6 +108,25 @@ class StopHookTest(unittest.TestCase):
     def test_plain_exchange_is_forwarded(self):
         self.assertEqual(self.stop([human("A"), assistant("a")], "a"), [["A", "a"]])
 
+    def test_wrapped_tee_reply_stays_local_and_next_normal_reply_is_forwarded(self):
+        text = ('\n\n<pasted_content id="30a7">\n[kibitz from:codex]'
+                '\n\nUSER:\nhello\n</pasted_content id="30a7">\n')
+        entries = [human(text), assistant("Hello!")]
+        with patch.object(hook, "notify") as notify:
+            self.assertEqual(self.stop(entries, "Hello!"), [])
+            self.assertEqual([call.args[0] for call in notify.call_args_list], ["skip"])
+        entries += [human("A new local question"), assistant("A local answer")]
+        self.assertEqual(self.stop(entries, "A local answer"), [["A new local question", "A local answer"]])
+
+    def test_background_reply_to_wrapped_tee_stays_local(self):
+        text = ('<pasted_content id="30a7">\n[kibitz from:codex]'
+                '\n\nUSER:\ncheck this\n</pasted_content id="30a7">')
+        entries = [human(text), launch("task"), assistant("Checking")]
+        with patch.object(hook, "notify"):
+            self.assertEqual(self.stop(entries, "Checking", running("task")), [])
+            entries += [notification("task"), assistant("Done checking")]
+            self.assertEqual(self.stop(entries, "Done checking"), [])
+
     def test_interim_stop_with_pending_task_is_suppressed(self):
         entries = [human("A"), launch("t1"), assistant("waiting")]
         self.assertEqual(self.stop(entries, "waiting", running("t1")), [])
